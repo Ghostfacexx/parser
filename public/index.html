@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Archiver ñ Stable UI + Advanced</title>
+<title>Archiver ÔøΩ Stable UI + Advanced</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <!-- MARKER: MINIMAL_UI_V2_ADV -->
 <style>
@@ -41,17 +41,19 @@ summary{cursor:pointer;font-weight:600}
 </style>
 </head>
 <body>
-<header><h1>Archiver ñ Stable UI + Advanced</h1></header>
+<header><h1>Archiver ÔøΩ Stable UI + Advanced</h1></header>
 <main>
 
 <section>
   <h2>Capture</h2>
   <textarea id="seedInput" rows="4" placeholder="https://www.vivacom.bg/"></textarea>
+  <div id="recentSeedsWrap" class="small"></div>
   <div class="row">
     <div class="col">
       <label class="opt"><input type="checkbox" id="optProfiles" checked>desktop,mobile</label>
       <label class="opt"><input type="checkbox" id="optAggressive">aggressive</label>
-      <label class="opt"><input type="checkbox" id="optPreserve">preserve paths</label>
+  <label class="opt" title="Save assets and pages using original paths for a true mirror"><input type="checkbox" id="optPreserve" checked>preserve paths</label>
+        <label class="opt"><input type="checkbox" id="optBlockTrackers"> Block analytics/ads/pixels</label>
       <label class="opt"><input type="checkbox" id="optScroll">scroll passes=2</label>
     </div>
     <div class="col">
@@ -64,8 +66,22 @@ summary{cursor:pointer;font-weight:600}
         <label class="opt"><input type="checkbox" id="autoSameHost" checked>same host</label>
         <label class="opt"><input type="checkbox" id="autoSubs" checked>include subdomains</label>
       </div>
-      <input id="autoAllow" placeholder="allow regex (optional)">
-      <input id="autoDeny" placeholder="deny regex (optional)">
+      <div class="row">
+        <div class="col">
+          <input id="autoAllow" placeholder="allow regex (optional)">
+          <select id="autoAllowPreset">
+            <option value="">Preset: (none)</option>
+            <option value="route=product/(?:category|product)|product_id=|/product(?:/\\?)|/category(?:/\\?)|/collections?|/brand|/manufacturer">Preset: Products & Categories</option>
+          </select>
+        </div>
+        <div class="col">
+          <input id="autoDeny" placeholder="deny regex (optional)">
+          <select id="autoDenyPreset">
+            <option value="">Preset: (none)</option>
+            <option value="account|register|login|logout|checkout|cart|wishlist|compare|contact|information/contact|search|tag|affiliate|newsletter|tracking|return">Preset: Account/Checkout/etc</option>
+          </select>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -92,6 +108,17 @@ summary{cursor:pointer;font-weight:600}
               <option value="true" selected>true</option>
               <option value="false">false</option>
             </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="col">
+          <label class="opt" title="Mask common automation fingerprints (navigator.webdriver, languages, plugins, WebGL)"><input type="checkbox" id="advStealth" checked>stealth</label>
+        </div>
+        <div class="col">
+          <label>Proxy
+            <input id="advProxy" placeholder="host:port[:user:pass] or http://user:pass@host:port">
           </label>
         </div>
       </div>
@@ -129,7 +156,10 @@ summary{cursor:pointer;font-weight:600}
         <label class="opt"><input type="checkbox" id="advMirrorCross">mirror cross-origin</label>
         <label class="opt"><input type="checkbox" id="advIncludeCO">include cross-origin</label>
         <label class="opt"><input type="checkbox" id="advRewriteHtmlAssets" checked>rewrite html assets</label>
-        <label class="opt"><input type="checkbox" id="advFlattenRoot">flatten root index</label>
+  <label class="opt"><input type="checkbox" id="advFlattenRoot">flatten root index</label>
+        <label class="opt" title="Workaround for sites that break over HTTP/2 during crawl"><input type="checkbox" id="advDisableHttp2">disable HTTP/2 (crawl)</label>
+  <label class="opt" title="Skip external crawler and discover links inside archiver (experimental)"><input type="checkbox" id="advDiscoverInArchiver">discover inside archiver</label>
+  <label class="opt" title="Plan-first: build an explicit seed list (home, categories, products) before capture"><input type="checkbox" id="advPlanFirst">plan-first mapper</label>
       </div>
 
       <input id="advInternalRegex" placeholder="internal rewrite regex (optional)">
@@ -164,6 +194,7 @@ summary{cursor:pointer;font-weight:600}
     <button id="btnStart">Start Run</button>
     <button id="btnStop" class="secondary" disabled>Stop Run</button>
     <button id="btnForceRefresh" class="secondary">Refresh Runs</button>
+    <button id="btnInstallBrowsers" class="secondary" title="Install Playwright browsers (chromium)">Install Browsers</button>
   </div>
 
   <details style="margin-top:.6rem">
@@ -179,8 +210,22 @@ summary{cursor:pointer;font-weight:600}
         <label class="opt"><input type="checkbox" id="crawlSameHost" checked>same host</label>
         <label class="opt"><input type="checkbox" id="crawlSubs" checked>include subdomains</label>
       </div>
-      <input id="crawlAllow" placeholder="allow regex (optional)">
-      <input id="crawlDeny" placeholder="deny regex (optional)">
+      <div class="row">
+        <div class="col">
+          <input id="crawlAllow" placeholder="allow regex (optional)">
+          <select id="crawlAllowPreset">
+            <option value="">Preset: (none)</option>
+            <option value="route=product/(?:category|product)|product_id=|/product(?:/\\?)|/category(?:/\\?)|/collections?|/brand|/manufacturer">Preset: Products & Categories</option>
+          </select>
+        </div>
+        <div class="col">
+          <input id="crawlDeny" placeholder="deny regex (optional)">
+          <select id="crawlDenyPreset">
+            <option value="">Preset: (none)</option>
+            <option value="account|register|login|logout|checkout|cart|wishlist|compare|contact|information/contact|search|tag|affiliate|newsletter|tracking|return">Preset: Account/Checkout/etc</option>
+          </select>
+        </div>
+      </div>
       <div class="flex">
         <button id="btnStartCrawlFirst">Start: Crawl then Capture</button>
       </div>
@@ -202,11 +247,46 @@ summary{cursor:pointer;font-weight:600}
 </section>
 
 <section>
+  <h2>Plan Builder</h2>
+  <div class="group">
+    <div class="row">
+      <div class="col"><textarea id="planStartUrls" rows="2" placeholder="https://example.com/"></textarea></div>
+      <div class="col"><button id="btnPlanBuild">Build Plan</button></div>
+    </div>
+    <div class="small">Metrics: <span id="planMetrics">-</span></div>
+    <div class="row">
+      <div class="col">
+        <h3>Available URLs</h3>
+        <div id="planAvailable" style="max-height:200px;overflow:auto;border:1px solid #dde2e6;border-radius:6px"></div>
+      </div>
+      <div class="col">
+        <h3>Selected (orderable)</h3>
+        <div id="planSelected" style="max-height:200px;overflow:auto;border:1px solid #dde2e6;border-radius:6px"></div>
+      </div>
+    </div>
+    <div class="flex" style="margin-top:.5rem">
+      <button id="btnPlanSelect">Add ‚Üí</button>
+      <button id="btnPlanSelectAll" class="secondary" title="Select all available URLs">Select All</button>
+      <button id="btnPlanRemove" class="secondary">‚Üê Remove</button>
+      <button id="btnPlanUp" class="secondary">Move Up</button>
+      <button id="btnPlanDown" class="secondary">Move Down</button>
+      <button id="btnPlanStart" title="Start capture using the Selected list as seeds">Start Capture</button>
+      <button id="btnPlanSave" class="secondary">Save Curated</button>
+      <button id="btnPlanExport" class="secondary">Export JSON</button>
+      <input type="file" id="planImportFile" style="display:none" accept="application/json">
+      <button id="btnPlanImport" class="secondary">Import JSON</button>
+    </div>
+    <div class="small" id="planStatus" style="margin-top:.25rem;color:#444"></div>
+  </div>
+</section>
+
+<section>
   <h2>Host</h2>
   <div class="flex">
     <input id="hostRun" placeholder="Select a run from table" readonly>
     <input id="hostPort" class="inlineSmall" value="8081">
     <button id="btnHost">Host</button>
+    <button id="btnOpenHost" class="secondary" disabled>Open</button>
     <button id="btnStopHost" class="secondary" disabled>Stop</button>
   </div>
   <pre id="hostLog"></pre>
@@ -256,13 +336,14 @@ summary{cursor:pointer;font-weight:600}
   <pre id="liveLog"></pre>
 </section>
 
-</main>
-<script src="/static/app.js"></script>
-<script src="/static/js/export.js"></script>
-<script src="/static/js/prep-run.js"></script>
-<script src="/static/js/prime-products.js"></script>
-<script src="/static/js/delete-run-ui.js"></script>
-<script src="/static/js/products-only-ui.js"></script>
-<script src="/static/js/woo-fast-preset.js"></script>
+ </main>
+<script src="/static/js/util.js?v=20250930"></script>
+<script src="/static/app.js?v=20250930"></script>
+<script src="/static/js/export.js?v=20250930"></script>
+<script src="/static/js/prep-run.js?v=20250930"></script>
+<script src="/static/js/prime-products.js?v=20250930"></script>
+<script src="/static/js/delete-run-ui.js?v=20250930"></script>
+<script src="/static/js/products-only-ui.js?v=20250930"></script>
+<script src="/static/js/woo-fast-preset.js?v=20250930"></script>
 </body>
 </html>

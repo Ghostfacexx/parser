@@ -57,9 +57,10 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { chromium } = require('playwright');
+const { chromium, firefox, webkit } = require('playwright');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const https = require('https');
+const http = require('http');
 
 /* ---------------- Utility Helpers ---------------- */
 function flag(name, def=false){
@@ -87,14 +88,32 @@ const MAX_DEPTH         = parseInt(process.env.MAX_DEPTH||'3',10);
 const SAME_HOST_ONLY    = flag('SAME_HOST_ONLY', true);
 const INCLUDE_SUBDOMAINS= flag('INCLUDE_SUBDOMAINS', true);
 const ALLOW_REGEX_STR   = process.env.ALLOW_REGEX || '';
-const DENY_REGEX_STR    = process.env.DENY_REGEX || '';
+let   DENY_REGEX_STR    = process.env.DENY_REGEX || '';
+// Optional tracker blocking
+const TRACKER_BLOCK     = flag('TRACKER_BLOCK', false);
+const TRACKER_DENY_REGEX= process.env.TRACKER_DENY_REGEX || '';
+if (TRACKER_BLOCK && TRACKER_DENY_REGEX) {
+  DENY_REGEX_STR = DENY_REGEX_STR
+    ? `(?:${DENY_REGEX_STR})|(?:${TRACKER_DENY_REGEX})`
+    : TRACKER_DENY_REGEX;
+}
 const KEEP_QUERY_PARAMS = (process.env.KEEP_QUERY_PARAMS||'').split(',').map(s=>s.trim()).filter(Boolean);
 const STRIP_ALL_QUERIES = flag('STRIP_ALL_QUERIES', false);
 const WAIT_AFTER_LOAD   = parseInt(process.env.WAIT_AFTER_LOAD||'500',10);
 const NAV_TIMEOUT       = parseInt(process.env.NAV_TIMEOUT||'15000',10);
 const PAGE_TIMEOUT      = parseInt(process.env.PAGE_TIMEOUT||'45000',10); // (placeholder)
-const USER_AGENT = process.env.USER_AGENT ||
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// Engine/headless for parity with archiver
+const ENGINE = (process.env.ENGINE || 'chromium').toLowerCase();
+const HEADLESS = flag('HEADLESS', true);
+const DISABLE_HTTP2 = flag('DISABLE_HTTP2', false);
+const STEALTH = flag('STEALTH', true);
+const PAGE_WAIT_UNTIL = (process.env.PAGE_WAIT_UNTIL || 'domcontentloaded');
+// Default UA tuned by engine unless overridden
+const USER_AGENT = process.env.USER_AGENT || (
+  ENGINE==='webkit'
+    ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+);
 
 const PROXIES_FILE  = process.env.PROXIES_FILE || '';
 const STABLE_SESSION= flag('STABLE_SESSION', true);
@@ -134,7 +153,7 @@ function nextProxy(pagesDone){
 }
 
 /* Normalization */
-function normalizeURL(raw, rootHost){
+function normalizeURL(raw, rootHost, opts={}){
   let u;
   try {
     u = new URL(raw);
@@ -164,7 +183,7 @@ function normalizeURL(raw, rootHost){
   try {
     if (u.pathname !== '/' && final.endsWith('/')) final=final.slice(0,-1);
   } catch {}
-  if (allowRx && !allowRx.test(final)) return null;
+  if (!opts.bypassAllow && allowRx && !allowRx.test(final)) return null;
   if (denyRx && denyRx.test(final)) return null;
   return final;
 }
@@ -172,12 +191,125 @@ function normalizeURL(raw, rootHost){
 /* Browser creation (chromium only for speed; can be extended) */
 async function createBrowser(proxyObj){
   const args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'];
-  const launch={ headless:true };
+  if (DISABLE_HTTP2) {
+    // Mitigate servers that misbehave over HTTP/2
+    args.push('--disable-http2');
+    args.push('--disable-quic');
+    args.push('--disable-features=UseChromeLayeredNetworkStack');
+  }
+  const launch={ headless:HEADLESS };
   if(proxyObj){
     launch.proxy={ server:proxyObj.server, username:proxyObj.username, password:proxyObj.password };
   }
   launch.args=args;
-  return chromium.launch(launch);
+  const bt = ENGINE==='firefox' ? firefox : ENGINE==='webkit' ? webkit : chromium;
+  return bt.launch(launch);
+}
+
+async function applyStealth(context){
+  if(!STEALTH) return;
+  try {
+    await context.addInitScript(() => {
+      try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch {}
+    });
+    await context.addInitScript(() => {
+      try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] }); } catch {}
+    });
+    await context.addInitScript(() => {
+      try { Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] }); } catch {}
+    });
+    await context.addInitScript(() => {
+      try {
+        const gp = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(param){
+          if (param === 37445) return 'Intel Inc.';
+          if (param === 37446) return 'Intel Iris OpenGL Engine';
+          return gp.apply(this, [param]);
+        };
+      } catch {}
+    });
+  } catch {}
+}
+
+function rint(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+async function humanizePage(page){
+  try{
+    const w=1366,h=900;
+    const steps=rint(2,5);
+    await page.mouse.move(rint(10,w-10), rint(10,h-10), { steps:rint(8,16) });
+    for(let i=0;i<steps;i++){
+      await page.waitForTimeout(rint(100,260));
+      await page.mouse.move(rint(10,w-10), rint(10,h-10), { steps:rint(5,10) });
+      if(Math.random()<0.4){ await page.mouse.wheel({deltaY:rint(120,480)}); }
+    }
+  }catch{}
+}
+
+async function fetchHtmlRaw(u, headers={}){
+  return new Promise((resolve)=>{
+    try{
+      const url = new URL(u);
+      const lib = url.protocol === 'https:' ? https : http;
+      // Optional proxy
+      let agent;
+      try{
+        const p = nextProxy(0);
+        if(p){
+          const auth = (p.username?`${encodeURIComponent(p.username)}:${encodeURIComponent(p.password||'')}@`:'');
+          const server = p.server.replace(/^https?:\/\//,'');
+          const proxyUrl = `http://${auth}${server}`;
+          agent = new HttpsProxyAgent(proxyUrl);
+        }
+      }catch{}
+      const req = lib.request({
+        hostname: url.hostname,
+        port: url.port || (url.protocol==='https:'?443:80),
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': USER_AGENT,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+          ...headers
+        },
+        agent,
+        timeout: Math.min(15000, NAV_TIMEOUT)
+      },(res)=>{
+        if((res.statusCode||0) >= 300 && (res.statusCode||0) < 400 && res.headers.location){
+          try{
+            const loc = new URL(res.headers.location, u).toString();
+            // simple one-hop follow
+            fetchHtmlRaw(loc, headers).then(resolve);
+          }catch{ resolve(null); }
+          return;
+        }
+        if((res.statusCode||0) !== 200){ resolve(null); return; }
+        let buf='';
+        res.setEncoding('utf8');
+        res.on('data',d=> buf+=d);
+        res.on('end',()=> resolve(buf||''));
+      });
+      req.on('error',()=> resolve(null));
+      req.on('timeout',()=>{ try{ req.destroy(); }catch{} resolve(null); });
+      req.end();
+    } catch { resolve(null); }
+  });
+}
+
+function extractAnchors(html){
+  if(!html) return [];
+  const out=[];
+  try{
+    const re=/href\s*=\s*([\"'])(.*?)\1/gi;
+    let m;
+    while((m=re.exec(html))){
+      const href = m[2];
+      if(href && typeof href === 'string') out.push(href);
+      if(out.length>2000) break; // cap
+    }
+  }catch{}
+  return out;
 }
 
 /* Optional STOP flag file */
@@ -198,12 +330,13 @@ async function crawl(){
 
   const queue=[];               // BFS queue: {url, depth}
   const seen=new Set();         // all normalized URLs ever seen (discovered)
-  const visitedOrder=[];        // order of ACTUAL FETCHES (pages we opened) -> seeds for archiver
+  const visitedOrder=[];        // order of ACTUAL FETCHES (pages we opened)
+  const visitedSeeds=[];        // subset of visited that match allow (or all if no allow)
   const depths=new Map();       // url -> depth (for graph)
   const edges=[];               // {from,to}
 
   START_URLS.forEach(u=>{
-    const n=normalizeURL(u, rootHost);
+    const n=normalizeURL(u, rootHost, { bypassAllow:true });
     if(n && !seen.has(n)){
       seen.add(n);
       depths.set(n,0);
@@ -218,9 +351,10 @@ async function crawl(){
     viewport:{width:1366,height:900},
     locale:'en-US'
   });
+  await applyStealth(context);
 
   async function processItem(item){
-    if (pagesCrawled >= MAX_PAGES) return;
+    if (visitedSeeds.length >= MAX_PAGES) return;
     if (item.depth > MAX_DEPTH) return;
     if (stopRequested(OUTPUT_DIR)) return;
 
@@ -230,20 +364,75 @@ async function crawl(){
     try {
       page=await context.newPage();
       page.setDefaultNavigationTimeout(NAV_TIMEOUT);
-      await page.goto(item.url,{ waitUntil:'domcontentloaded' });
-      if (WAIT_AFTER_LOAD>0) await page.waitForTimeout(WAIT_AFTER_LOAD);
+      // Primary navigation with configured lifecycle
+      let navigated=false;
+      try {
+        await page.goto(item.url,{ waitUntil: PAGE_WAIT_UNTIL, timeout: NAV_TIMEOUT });
+        navigated=true;
+      } catch (e) {
+        console.log(`[CRAWL_WARN] primary goto failed (${PAGE_WAIT_UNTIL}) ${e.message}`);
+        // Fallback A: try fast commit to bypass long blocking (e.g., bot checks), then best-effort DOM wait
+        try {
+          await page.goto(item.url, { waitUntil: 'commit', timeout: Math.min(15000, NAV_TIMEOUT) });
+          navigated=true;
+          try { await page.waitForLoadState('domcontentloaded', { timeout: Math.min(15000, NAV_TIMEOUT) }); } catch {}
+        } catch (e2) {
+          // Fallback B: raw HTML fetch + anchor extraction (no JS)
+          const raw = await fetchHtmlRaw(item.url);
+          if (raw) {
+            const anchors = extractAnchors(raw);
+            // Mark visited even if headless navigation failed; we at least fetched HTML
+            visitedOrder.push(item.url);
+            pagesCrawled++;
+            const allowedForSeed = allowRx ? allowRx.test(item.url) : true;
+            if (allowedForSeed) visitedSeeds.push(item.url);
+            // feed anchors to queue
+            for(const rawHref of anchors){
+              const resolved = (()=>{ try{ return new URL(rawHref, item.url).toString(); }catch{ return null; } })();
+              if(!resolved) continue;
+              const norm=normalizeURL(resolved, rootHost);
+              if(!norm) continue;
+              edges.push({ from:item.url, to:norm });
+              if(!seen.has(norm)){
+                seen.add(norm);
+                const d=item.depth+1;
+                depths.set(norm,d);
+                if (d <= MAX_DEPTH && visitedOrder.length < MAX_PAGES){
+                  queue.push({ url:norm, depth:d });
+                }
+              }
+            }
+            console.log(`[CRAWL_FALLBACK] used raw HTML fetch, anchors=${anchors.length}`);
+            // continue to link extraction path without DOM
+          } else {
+            throw e; // give up
+          }
+        }
+      }
+  if (WAIT_AFTER_LOAD>0) await page.waitForTimeout(WAIT_AFTER_LOAD);
+  try{ await humanizePage(page); }catch{}
       // Mark visited
-      visitedOrder.push(item.url);
-      pagesCrawled++;
+  visitedOrder.push(item.url);
+  pagesCrawled++;
+  const allowedForSeed = allowRx ? allowRx.test(item.url) : true;
+  if (allowedForSeed) visitedSeeds.push(item.url);
 
-      // Extract links only if we can still expand
-      if (pagesCrawled < MAX_PAGES && item.depth < MAX_DEPTH){
-        const hrefs=await page.$$eval('a[href]', as=>as.map(a=>a.getAttribute('href')));
+  // Extract links only if we can still expand and we have a DOM (navigated true)
+  if (navigated && pagesCrawled < MAX_PAGES && item.depth < MAX_DEPTH){
+        let hrefs=[];
+        try {
+          hrefs=await page.$$eval('a[href]', as=>as.map(a=>a.getAttribute('href')));
+          if (!hrefs || hrefs.length===0) {
+            // wait briefly for dynamic anchors to appear
+            try { await page.waitForSelector('a[href]', { timeout: Math.min(8000, NAV_TIMEOUT) }); } catch {}
+            hrefs=await page.$$eval('a[href]', as=>as.map(a=>a.getAttribute('href')));
+          }
+        } catch {}
         for(const raw of hrefs){
           if(!raw) continue;
           let resolved;
             try { resolved=new URL(raw, item.url).toString(); } catch { continue; }
-          const norm=normalizeURL(resolved, rootHost);
+          const norm=normalizeURL(resolved, rootHost, { bypassAllow:true });
           if(!norm) continue;
           edges.push({ from:item.url, to:norm });
           if(!seen.has(norm)){
@@ -251,7 +440,7 @@ async function crawl(){
             const d=item.depth+1;
             depths.set(norm,d);
             // Enqueue only if we still can fetch more pages and depth within limit
-            if (d <= MAX_DEPTH && visitedOrder.length < MAX_PAGES){
+            if (d <= MAX_DEPTH && visitedSeeds.length < MAX_PAGES){
               queue.push({ url:norm, depth:d });
             }
           }
@@ -267,7 +456,7 @@ async function crawl(){
     }
   }
 
-  while(queue.length && pagesCrawled < MAX_PAGES){
+  while(queue.length && visitedSeeds.length < MAX_PAGES){
     if (stopRequested(OUTPUT_DIR)) break;
     const item=queue.shift();
     await processItem(item);
@@ -276,7 +465,7 @@ async function crawl(){
   try { await browser.close(); } catch {}
 
   // seedsForArchive: exactly the visited pages (limit enforced)
-  const seedsForArchive = visitedOrder.slice(0, MAX_PAGES);
+  const seedsForArchive = visitedSeeds.slice(0, MAX_PAGES);
   // For debugging: full discovered set
   fs.writeFileSync(path.join(crawlDir,'discovered-debug.txt'), Array.from(seen).join('\n')+'\n','utf8');
   // Output only fetched pages to urls.txt

@@ -25,6 +25,7 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const https = require('https');
 const cheerio = require('cheerio');
 const { buildSameSiteChecker, getETLDPlusOne } = require('./lib/domain.cjs');
+const cp = require('child_process');
 
 /* ------------ Utility ------------ */
 function envB(name, def=false){ const v=process.env[name]; if(v==null) return def; return /^(1|true|yes|on)$/i.test(v); }
@@ -77,16 +78,56 @@ const ALT_USER_AGENTS=(process.env.ALT_USER_AGENTS||'').split(',').map(s=>s.trim
 const DOMAIN_FILTER_ENV=process.env.DOMAIN_FILTER||'';
 const REWRITE_INTERNAL=envB('REWRITE_INTERNAL',true);
 const INTERNAL_REWRITE_REGEX=process.env.INTERNAL_REWRITE_REGEX||'';
+// Default: use 'index' folder for root (do not flatten), to keep page variants under /index/desktop and /index/mobile
 const FLATTEN_ROOT_INDEX=envB('FLATTEN_ROOT_INDEX',false);
 
-const PRESERVE_ASSET_PATHS=envB('PRESERVE_ASSET_PATHS',false);
+// Mirror defaults: preserve original asset paths for same-site to achieve an identical structure
+const PRESERVE_ASSET_PATHS=envB('PRESERVE_ASSET_PATHS',true);
 const MIRROR_SUBDOMAINS=envB('MIRROR_SUBDOMAINS',true);
 const MIRROR_CROSS_ORIGIN=envB('MIRROR_CROSS_ORIGIN',false);
 const REWRITE_HTML_ASSETS=envB('REWRITE_HTML_ASSETS',true);
 const INLINE_SMALL_ASSETS=envN('INLINE_SMALL_ASSETS',0);
 const PAGE_WAIT_UNTIL=(process.env.PAGE_WAIT_UNTIL||'domcontentloaded');
+// Primary submitted URL (from GUI). We guarantee it's captured and becomes the root redirect target.
+const PRIMARY_START_URL = process.env.PRIMARY_START_URL || '';
+// Optional tracker blocking (ads/analytics/pixels)
+const BLOCK_TRACKERS = envB('BLOCK_TRACKERS', false);
+const TRACKER_SKIP_PATTERNS = (process.env.TRACKER_SKIP_PATTERNS||'').split(',').map(s=>s.trim()).filter(Boolean);
+let TRACKER_RX = null; try{
+  TRACKER_RX = TRACKER_SKIP_PATTERNS.length ? new RegExp(TRACKER_SKIP_PATTERNS.map(s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|'),'i') : null;
+}catch{ TRACKER_RX = null; }
 let QUIET_MILLIS=envN('QUIET_MILLIS',1500);
 let MAX_CAPTURE_MS=envN('MAX_CAPTURE_MS',20000);
+
+/* Payment map auto-generation (for host-time payment link rewrites) */
+const PAYMENT_MAP_AUTO = envB('PAYMENT_MAP_AUTO', true);
+const PAYMENT_PROVIDER = process.env.PAYMENT_PROVIDER || 'paypal';
+const PAYMENT_TARGET = process.env.PAYMENT_TARGET || '_blank';
+const PAYMENT_PLACEHOLDER = process.env.PAYMENT_PLACEHOLDER || 'paypal:HOSTED_BUTTON_ID_PLACEHOLDER';
+// Collected product IDs during capture: id -> { url, title }
+const FOUND_PRODUCT_IDS = new Map();
+
+/* Commerce flow discovery (external tool) */
+const COMMERCE_FLOW = envB('COMMERCE_FLOW', false);
+const COMMERCE_FLOW_MODE = process.env.COMMERCE_FLOW_MODE || 'once'; // 'once' | 'off'
+const COMMERCE_PLATFORM_HINT = process.env.COMMERCE_PLATFORM_HINT || 'opencart';
+
+// Pages are saved under per-profile subfolders (e.g., rel/desktop/index.html, rel/mobile/index.html)
+
+/* Optional internal discovery (no external crawler) */
+const DISCOVER_IN_ARCHIVER = envB('DISCOVER_IN_ARCHIVER', false);
+const DISCOVER_MAX_PAGES = envN('DISCOVER_MAX_PAGES', 50);
+const DISCOVER_MAX_DEPTH = envN('DISCOVER_MAX_DEPTH', 1);
+const DISCOVER_ALLOW_REGEX = process.env.DISCOVER_ALLOW_REGEX || '';
+const DISCOVER_DENY_REGEX = process.env.DISCOVER_DENY_REGEX || '';
+let DISCOVER_ALLOW_RX = null, DISCOVER_DENY_RX = null;
+try { if (DISCOVER_ALLOW_REGEX) DISCOVER_ALLOW_RX = new RegExp(DISCOVER_ALLOW_REGEX, 'i'); } catch {}
+try { if (DISCOVER_DENY_REGEX) DISCOVER_DENY_RX = new RegExp(DISCOVER_DENY_REGEX, 'i'); } catch {}
+function isAllowedByDiscover(url){
+  const a = DISCOVER_ALLOW_RX ? DISCOVER_ALLOW_RX.test(url) : true;
+  const d = DISCOVER_DENY_RX ? !DISCOVER_DENY_RX.test(url) : true;
+  return a && d;
+}
 
 /* Same-site ENV */
 const SAME_SITE_MODE=(process.env.SAME_SITE_MODE||'etld').toLowerCase(); // 'exact' | 'subdomains' | 'etld'
@@ -207,13 +248,49 @@ function readSeeds(f){
   if(DOMAIN_FILTER_ENV){
     try{ const rx=new RegExp(DOMAIN_FILTER_ENV,'i'); lines=lines.filter(l=>rx.test(l)); }catch{}
   }
+  // Ensure PRIMARY_START_URL is included and first, if provided
+  try{
+    if (PRIMARY_START_URL) {
+      const set = new Set(lines);
+      set.delete(PRIMARY_START_URL);
+      return [PRIMARY_START_URL, ...set];
+    }
+  } catch {}
   return [...new Set(lines)];
 }
 function localPath(uStr){
   const u=new URL(uStr);
-  let p=u.pathname.replace(/\/+$/,'');
-  if(p==='') return FLATTEN_ROOT_INDEX ? '' : 'index';
-  return p.replace(/^\/+/,'');
+  return pageRelFromUrl(u);
+}
+
+// Include query params in page path to uniquely map dynamic routes (e.g., index.php?route=category)
+const INCLUDE_PAGE_QUERY_IN_PATH = envB('INCLUDE_PAGE_QUERY_IN_PATH', true);
+function slugifyQuery(searchParams){
+  try{
+    const entries = [];
+    for (const [k,v] of searchParams.entries()) entries.push([k,v]);
+    entries.sort((a,b)=> a[0]===b[0] ? String(a[1]).localeCompare(String(b[1])) : a[0].localeCompare(b[0]));
+    const parts = entries.map(([k,v])=>{
+      const kk=String(k).replace(/[^a-z0-9]+/gi,'_').replace(/^_+|_+$/g,'');
+      const vv=String(v).replace(/[^a-z0-9]+/gi,'_').replace(/^_+|_+$/g,'');
+      return kk + (vv?('_'+vv):'');
+    }).filter(Boolean);
+    if(!parts.length) return '';
+    const slug = parts.join('__');
+    return slug.length>120 ? (slug.slice(0,100)+'__'+sha16(slug)) : slug;
+  }catch{ return ''; }
+}
+function pageRelFromUrl(u){
+  let p=(u.pathname||'').replace(/\/+$/,'');
+  if(p==='') p = FLATTEN_ROOT_INDEX ? '' : 'index';
+  else p = p.replace(/^\/+/,'');
+  if(INCLUDE_PAGE_QUERY_IN_PATH){
+    try{
+      const qs = slugifyQuery(u.searchParams||new URLSearchParams());
+      if(qs){ p = (p||'index') + '__' + qs; }
+    }catch{}
+  }
+  return p;
 }
 
 /* ------------ Proxies ------------ */
@@ -271,7 +348,11 @@ function chooseUA(profile){
 }
 async function createBrowser(proxyObj){
   const args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'];
-  if(DISABLE_HTTP2 && ENGINE==='chromium') args.push('--disable-http2');
+  if(DISABLE_HTTP2 && ENGINE==='chromium'){
+    args.push('--disable-http2');
+    args.push('--disable-quic');
+    args.push('--disable-features=UseChromeLayeredNetworkStack');
+  }
   const launch={ headless:HEADLESS };
   if(proxyObj) launch.proxy={ server:proxyObj.server, username:proxyObj.username, password:proxyObj.password };
   if(ENGINE==='chromium') launch.args=args;
@@ -308,6 +389,25 @@ async function applyStealth(context){
   } catch {}
 }
 
+/* ------------ Humanization (light) ------------ */
+function rint(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+async function humanizePage(page, profile){
+  try{
+    const w = (profile?.viewport?.width)||1366, h=(profile?.viewport?.height)||900;
+    const steps = rint(3,6);
+    await page.mouse.move(rint(10,w-10), rint(10,h-10), { steps:rint(8,18) });
+    for(let i=0;i<steps;i++){
+      await page.waitForTimeout(rint(120,320));
+      await page.mouse.move(rint(10,w-10), rint(10,h-10), { steps:rint(5,12) });
+      if(Math.random()<0.4){
+        await page.mouse.wheel({ deltaY: rint(150, 600) });
+      }
+    }
+    if(Math.random()<0.25){ try{ await page.keyboard.press('PageDown'); }catch{} }
+    if(Math.random()<0.15){ try{ await page.mouse.click(rint(40,w-40), rint(80,h-80)); }catch{} }
+  }catch{}
+}
+
 /* ------------ Same-site checker ------------ */
 let isSameSite = (_)=>true;
 
@@ -335,21 +435,22 @@ function decideAssetLocalPath(targetUrl, baseOrigin){
   return { localPath:file, rewriteTo:file, group:'hashed' };
 }
 function shouldSkipDownloadUrl(url){
-  return SKIP_DOWNLOAD_PATTERNS.some(p=>p && url.includes(p));
+  if (SKIP_DOWNLOAD_PATTERNS.some(p=>p && url.includes(p))) return true;
+  if (BLOCK_TRACKERS && TRACKER_RX && TRACKER_RX.test(url)) return true;
+  return false;
 }
 
 /* ------------ HTML asset rewrite ------------ */
-function rewriteHTML(html,assetIndex){
+function rewriteHTML(html,assetIndex, baseOrigin){
   if(!REWRITE_HTML_ASSETS) return html;
   const $=cheerio.load(html,{decodeEntities:false});
   function processAttr(el,attr){
     const val=$(el).attr(attr); if(!val) return;
-    const cands=[val];
-    if(/^\/\//.test(val)) cands.push('https:'+val,'http:'+val);
-    for(const c of cands){
-      const rec=assetIndex.get(c);
-      if(rec){ $(el).attr(attr,rec.rewriteTo); return; }
-    }
+    // Resolve relative values to absolute to match assetIndex keys
+    const cands=[];
+    try{ cands.push(new URL(val, baseOrigin).toString()); }catch{ cands.push(val); }
+    if(/^\/\//.test(val)) { cands.push('https:'+val,'http:'+val); }
+    for(const c of cands){ const rec=assetIndex.get(c); if(rec){ $(el).attr(attr,rec.rewriteTo); return; } }
   }
   $('link,script,img,source,iframe,video,audio').each((_,el)=>{
     ['href','src','data-src','poster','srcset'].forEach(a=>processAttr(el,a));
@@ -357,7 +458,10 @@ function rewriteHTML(html,assetIndex){
   $('img[srcset],source[srcset]').each((_,el)=>{
     const val=$(el).attr('srcset'); if(!val) return;
     const parts=val.split(',').map(p=>p.trim()).map(p=>{
-      const seg=p.split(/\s+/); const rec=assetIndex.get(seg[0]); if(rec) seg[0]=rec.rewriteTo; return seg.join(' ');
+      const seg=p.split(/\s+/);
+      let abs=seg[0];
+      try{ abs=new URL(seg[0], baseOrigin).toString(); }catch{}
+      const rec=assetIndex.get(abs); if(rec) seg[0]=rec.rewriteTo; return seg.join(' ');
     });
     $(el).attr('srcset',parts.join(', '));
   });
@@ -767,7 +871,8 @@ async function handlePopups(page){
 /* ------------ Per-Profile Capture Core ------------ */
 async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
   const profileDirName = profile.name === 'desktop' ? 'desktop' : profile.name;
-  const pageDirBase = rel ? path.join(outRoot,rel) : outRoot;
+  // Normalize base dir: when rel==='' (flatten root), store under /index/<profile>/ to keep layout consistent
+  const pageDirBase = (rel==='' ? path.join(outRoot,'index') : (rel ? path.join(outRoot,rel) : outRoot));
   const pageDir = path.join(pageDirBase, profileDirName);
   ensureDir(pageDir);
 
@@ -822,6 +927,12 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
 
     page.on('request',req=>{
       inflight++; activity();
+      // Drop tracker/analytics requests early
+      try{
+        if (BLOCK_TRACKERS && TRACKER_RX && TRACKER_RX.test(req.url())){
+          req.abort(); inflight--; return;
+        }
+      }catch{}
       if(shouldSkipDownloadUrl(req.url()) && req.resourceType()==='document'){
         try{ req.abort(); }catch{} inflight--;
       }
@@ -864,7 +975,10 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
     }
     record.mainStatus=resp?.status()||null;
     record.finalURL=resp?.url()||page.url();
-    try{ await page.waitForSelector('body',{timeout:10000}); }catch{ record.reasons.push('noBody'); }
+  try{ await page.waitForSelector('body',{timeout:10000}); }catch{ record.reasons.push('noBody'); }
+
+  // Human-like interaction to help pass simple bot gates
+  try{ await humanizePage(page, profile); }catch{}
 
     for(const sel of CLICK_SELECTORS){
       if(!sel) continue;
@@ -902,6 +1016,23 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
 
     let html=await page.content();
 
+    // Record product IDs for auto payment-map (OpenCart and Woo patterns)
+    try{
+      const u = new URL(page.url());
+      const route = (u.searchParams.get('route')||'').toLowerCase();
+      let pid = '';
+      if (/product\/product/.test(route)) pid = String(u.searchParams.get('product_id')||'');
+      if (!pid) pid = String(u.searchParams.get('add-to-cart')||'');
+      if (pid) {
+        let title='';
+        try{
+          const $ = cheerio.load(html,{decodeEntities:false});
+          title = $('#content h1').first().text().trim() || $('h1').first().text().trim() || '';
+        }catch{}
+        if (!FOUND_PRODUCT_IDS.has(pid)) FOUND_PRODUCT_IDS.set(pid, { url: page.url(), title });
+      }
+    }catch{}
+
     // Inject mobile meta viewport if mobile & missing
     if(profile.isMobile && INJECT_MOBILE_META){
       try{
@@ -926,16 +1057,24 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
           let u; try{ u=new URL(v,baseOrigin); }catch{return;}
           const internal = hostRx ? hostRx.test(u.hostname) : isSameSite(u);
           if(!internal) return;
-          let p=u.pathname;
-          if(!/\.[a-z0-9]{2,6}$/i.test(p) && !p.endsWith('/')) p+='/';
-          $(a).attr('href',p);
+          // If it looks like a document (no asset extension) OR it has query params, point to our local saved directory
+          const hasExt=/\.[a-z0-9]{2,6}$/i.test(u.pathname||'');
+          if(!hasExt || (u.search && u.search.length>1)){
+            const rel = pageRelFromUrl(u);
+            const href = '/' + (rel ? (rel + '/') : '');
+            $(a).attr('href', href + (u.hash||''));
+          } else {
+            // For direct files (e.g., PDF), keep as is relative to origin
+            let p=u.pathname; if(!p) p='/';
+            $(a).attr('href', p + (u.hash||''));
+          }
         });
         html=$.html();
       }catch(e){ record.reasons.push('rewriteInternalErr:'+e.message); }
     }
 
     if(REWRITE_HTML_ASSETS){
-      try{ html=rewriteHTML(html,sharedAssetIndex); }catch(e){ record.reasons.push('assetRewriteErr:'+e.message); }
+      try{ html=rewriteHTML(html,sharedAssetIndex, page.url()); }catch(e){ record.reasons.push('assetRewriteErr:'+e.message); }
     }
 
     // Inject offline fallback shim (preserves app logic; only falls back when live fails)
@@ -990,10 +1129,29 @@ async function capture(pageNum,url,outRoot){
 function ensureRootIndex(outDir, manifest){
   const rootIndex = path.join(outDir, 'index.html');
   if (fs.existsSync(rootIndex)) return; // don?t overwrite
-  const primary = manifest.find(r => r.profile === 'desktop') || manifest[0];
-  if (!primary) return;
-  const rel = (primary.relPath || '').replace(/^\/+/, '');
-  const target = '/' + (rel ? rel + '/' : '');
+  // Prefer the explicitly submitted URL (PRIMARY_START_URL) if available in manifest
+  let primary = null;
+  let rel = '';
+  if (PRIMARY_START_URL) {
+    try {
+      const u = new URL(PRIMARY_START_URL);
+      const desiredRel = pageRelFromUrl(u);
+      // find matching desktop record by relPath
+      primary = manifest.find(r => r.profile === 'desktop' && (r.relPath||'') === desiredRel)
+             || manifest.find(r => (r.relPath||'') === desiredRel)
+             || null;
+      rel = desiredRel;
+    } catch {}
+  }
+  if (!primary) {
+    primary = manifest.find(r => r.profile === 'desktop') || manifest[0];
+    if (!primary) return;
+    rel = (primary.relPath || '').replace(/^\/+/, '');
+  } else {
+    rel = (rel || '').replace(/^\/+/, '');
+  }
+  // If FLATTEN_ROOT_INDEX was used (rel==='' case), saved content lives under /index/<profile>/, so redirect to /index/
+  const target = '/' + (rel ? rel + '/' : 'index/');
   const title = (() => {
     try { return new URL(primary.url).hostname + ' snapshot'; } catch { return 'Snapshot'; }
   })();
@@ -1017,6 +1175,38 @@ function ensureRootIndex(outDir, manifest){
   }
 }
 
+/* ------------ Payment map writer ------------ */
+function writeAutoPaymentMap(outDir){
+  if (!PAYMENT_MAP_AUTO) return;
+  if (!FOUND_PRODUCT_IDS.size) return;
+  const file = path.join(outDir, '_payment-map.json');
+  let obj = { provider: PAYMENT_PROVIDER, target: PAYMENT_TARGET, map: {} };
+  try{
+    if (fs.existsSync(file)){
+      const current = JSON.parse(fs.readFileSync(file,'utf8')) || {};
+      obj.provider = current.provider || obj.provider;
+      obj.target = current.target || obj.target;
+      obj.map = current.map || {};
+    }
+  }catch{}
+  let added = 0;
+  for (const [pid] of FOUND_PRODUCT_IDS){
+    if (!pid) continue;
+    if (!obj.map[pid] && !obj.map['product_id_'+pid]){
+      obj.map[pid] = PAYMENT_PLACEHOLDER;
+      added++;
+    }
+  }
+  if (added>0){
+    try{
+      fs.writeFileSync(file, JSON.stringify(obj,null,2));
+      console.log('[PAYMENT_MAP]', 'written', path.relative(outDir,file), 'added', added, 'totalKeys', Object.keys(obj.map||{}).length);
+    }catch(e){ console.warn('[PAYMENT_MAP_ERR]', e.message); }
+  } else {
+    console.log('[PAYMENT_MAP]', 'no new products to add');
+  }
+}
+
 /* ------------ Main ------------ */
 (async()=>{
   const seeds=readSeeds(seedsFile);
@@ -1032,13 +1222,165 @@ function ensureRootIndex(outDir, manifest){
   ensureDir(outputRoot);
   console.log(`ARCHIVER start: urls=${seeds.length} engine=${ENGINE} concurrency=${CONCURRENCY} profiles=${PROFILES_LIST.join(',')}`);
 
+  // Internal discovery (BFS) before capture when enabled
+  let finalSeeds = seeds.slice();
+  if (DISCOVER_IN_ARCHIVER) {
+    console.log(`[DISCOVER] start inside archiver maxPages=${DISCOVER_MAX_PAGES} maxDepth=${DISCOVER_MAX_DEPTH}`);
+    const crawlDir = path.join(outputRoot, '_crawl');
+    ensureDir(crawlDir);
+    const visited = new Set();
+    const queue = [];
+    const depths = new Map();
+    const pushQ = (u, d) => {
+      if (!u) return;
+      if (visited.has(u)) return;
+      if (d > DISCOVER_MAX_DEPTH) return;
+      visited.add(u);
+      depths.set(u, d);
+      queue.push({ url: u, depth: d });
+    };
+    for (const s of seeds) pushQ(s, 0);
+
+    const proxy = nextProxy(0);
+    let browser, context, page;
+    try {
+      browser = await createBrowser(proxy);
+      const prof = resolveProfile('desktop');
+      context = await browser.newContext({
+        userAgent: chooseUA(prof),
+        viewport: prof.viewport,
+        deviceScaleFactor: prof.deviceScaleFactor||1,
+        isMobile: false,
+        hasTouch: false,
+        locale: 'en-US'
+      });
+      if (STEALTH) { try { await applyStealth(context); } catch {} }
+      page = await context.newPage();
+      page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+
+    const discovered = [];
+      while (queue.length && discovered.length < DISCOVER_MAX_PAGES) {
+        const { url, depth } = queue.shift();
+        // Navigate with fallback to commit if needed
+        let navigated = false;
+        try {
+          await page.goto(url, { waitUntil: PAGE_WAIT_UNTIL, timeout: NAV_TIMEOUT });
+          navigated = true;
+        } catch (e) {
+          console.log(`[DISCOVER_WARN] goto (${PAGE_WAIT_UNTIL}) failed ${e.message}`);
+          try {
+            await page.goto(url, { waitUntil: 'commit', timeout: Math.min(15000, NAV_TIMEOUT) });
+            navigated = true;
+            try { await page.waitForLoadState('domcontentloaded', { timeout: Math.min(10000, NAV_TIMEOUT) }); } catch {}
+          } catch (e2) {
+            console.log('[DISCOVER_ERR]', e2.message);
+          }
+        }
+
+        // Consent attempt to reveal links
+        if (navigated) {
+          try { await attemptConsent(page); } catch {}
+          try { await page.waitForTimeout(300); } catch {}
+        }
+
+        // Extract anchors (DOM if navigated, fallback to regex from page.content())
+        let hrefs = [];
+        try {
+          if (navigated) {
+            try { await page.waitForSelector('a[href]', { timeout: 5000 }); } catch {}
+            hrefs = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href')).filter(Boolean));
+          }
+        } catch {}
+        if (!hrefs.length) {
+          try {
+            const html = navigated ? await page.content() : '';
+            const re = /href\s*=\s*([\"'])(.*?)\1/gi;
+            let m; while ((m = re.exec(html))) { hrefs.push(m[2]); if (hrefs.length > 2000) break; }
+          } catch {}
+        }
+
+        // Normalize and enqueue
+        const baseOrigin = (()=>{ try { return new URL(url).origin; } catch { return ''; } })();
+        const normed = [];
+        for (const raw of hrefs) {
+          let abs; try { abs = new URL(raw, baseOrigin).toString(); } catch { continue; }
+          // strip hash
+          try { const u = new URL(abs); u.hash=''; abs=u.toString(); } catch {}
+          // same-site check
+          try { if (!isSameSite(abs)) continue; } catch {}
+          // For traversal: respect deny strictly, but don't require allow to expand (we may need intermediates)
+          if (DISCOVER_DENY_RX && DISCOVER_DENY_RX.test(abs)) continue;
+          normed.push(abs);
+        }
+        // Record (only if allowed) and expand next depth
+        if (!DISCOVER_ALLOW_RX && !DISCOVER_DENY_RX) {
+          discovered.push(url);
+        } else {
+          // Allow recording only when the current URL matches filters; seed (depth 0) is not forced
+          if (isAllowedByDiscover(url)) discovered.push(url);
+        }
+        if (depth < DISCOVER_MAX_DEPTH) {
+          for (const n of normed) {
+            if (discovered.length + queue.length >= DISCOVER_MAX_PAGES) break;
+            if (!visited.has(n)) pushQ(n, depth + 1);
+          }
+        }
+        console.log(`[DISCOVER] d=${depth} url=${url} +links=${normed.length} total=${discovered.length}`);
+      }
+
+      finalSeeds = discovered.slice(0, DISCOVER_MAX_PAGES);
+      // Make sure PRIMARY_START_URL stays first and present
+      try {
+        if (PRIMARY_START_URL) {
+          const set = new Set(finalSeeds);
+          set.delete(PRIMARY_START_URL);
+          finalSeeds = [PRIMARY_START_URL, ...set];
+        }
+      } catch {}
+      // Persist for transparency
+      try { fs.writeFileSync(path.join(crawlDir, 'urls.txt'), finalSeeds.join('\n') + '\n', 'utf8'); } catch {}
+      console.log(`[DISCOVER_DONE] seeds=${finalSeeds.length}`);
+      await browser.close();
+    } catch (e) {
+      console.log('[DISCOVER_FATAL]', e.message);
+      try { if (browser) await browser.close(); } catch {}
+    }
+  }
+
+  // Optional: run external commerce flow to discover product->cart->checkout URLs and add to seeds
+  if (COMMERCE_FLOW && COMMERCE_FLOW_MODE !== 'off') {
+    try {
+      const tool = path.join(__dirname, 'tools', 'commerce-flow.cjs');
+      const baseStart = (PRIMARY_START_URL || finalSeeds[0] || seeds[0] || '').trim();
+      if (fs.existsSync(tool) && baseStart) {
+        const outDir = path.join(outputRoot, '_commerce');
+        ensureDir(outDir);
+        const args = [tool, '--start', baseStart, '--platform', COMMERCE_PLATFORM_HINT, '--out', outDir, '--mode', COMMERCE_FLOW_MODE];
+        console.log('[COMMERCE_FLOW] run', 'node', path.relative(process.cwd(), tool), args.slice(1).join(' '));
+        cp.execFileSync(process.execPath, args, { stdio: 'inherit' });
+        const f = path.join(outDir, 'urls.txt');
+        if (fs.existsSync(f)) {
+          const extra = fs.readFileSync(f, 'utf8').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+          if (extra.length) {
+            const set = new Set(finalSeeds);
+            for (const u of extra) set.add(u);
+            finalSeeds = Array.from(set);
+            console.log('[COMMERCE_FLOW] merged URLs', extra.length, 'totalSeeds', finalSeeds.length);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[COMMERCE_FLOW_ERR]', e.message);
+    }
+  }
+
   const manifest=[];
   const partial=path.join(outputRoot,'manifest.partial.jsonl');
   let idx=0;
   async function worker(wid){
     while(true){
-      if(idx>=seeds.length) break;
-      const url=seeds[idx++];
+      if(idx>=finalSeeds.length) break;
+      const url=finalSeeds[idx++];
       console.log(`[W${wid}] (${idx}/${seeds.length}) ${url}`);
       const recs=await capture(idx,url,outputRoot);
       for(const r of recs){
@@ -1054,10 +1396,13 @@ function ensureRootIndex(outDir, manifest){
   fs.writeFileSync(manifestPath, JSON.stringify(manifest,null,2));
   const failures=manifest.filter(m=>!String(m.status||'').startsWith('ok'));
   const totalAssets=[...new Set(manifest.filter(m=>m.profile==='desktop').map(m=>m.assets))].reduce((a,b)=>a+b,0);
-  console.log(`DONE pages=${seeds.length} profiles=${PROFILES_LIST.length} records=${manifest.length} failures=${failures.length} (desktop assets approx=${totalAssets})`);
+  console.log(`DONE pages=${finalSeeds.length} profiles=${PROFILES_LIST.length} records=${manifest.length} failures=${failures.length} (desktop assets approx=${totalAssets})`);
 
   // Guarantee a root index.html exists and redirects to the captured page
   ensureRootIndex(outputRoot, manifest);
+
+  // Write/merge _payment-map.json with placeholders for discovered product IDs
+  try { writeAutoPaymentMap(outputRoot); } catch {}
 
   if(failures.length){
     console.log('Sample failures:');
