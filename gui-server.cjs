@@ -443,10 +443,29 @@ app.post('/api/run',(req,res)=>{
   startingJob = true;
 
   const { urlsText, options={}, crawlOptions={}, crawlFirst=false } = req.body||{};
-  const directURLs = urlsText ? urlsText.split(/\r?\n/).map(x=>x.trim()).filter(Boolean) : [];
+  function normalizeDirectUrls(text){
+    if(!text) return { accepted: [], skipped: [] };
+    const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    const out = [];
+    const skipped = [];
+    const seen = new Set();
+    for(const line of lines){
+      // Ignore obvious non-URL seeds like tel/mailto/plain text
+      if (/^(tel:|mailto:)/i.test(line)) { skipped.push(line); continue; }
+      if (!/^https?:\/\//i.test(line)) { skipped.push(line); continue; }
+      let u;
+      try { u = new URL(line); } catch { skipped.push(line); continue; }
+      u.hash = ''; // strip fragments like #accept-cookies
+      const norm = u.toString();
+      if (!seen.has(norm)) { seen.add(norm); out.push(norm); }
+    }
+    return { accepted: out, skipped };
+  }
+  const normRes = normalizeDirectUrls(urlsText);
+  const directURLs = normRes.accepted;
   if(!directURLs.length && !crawlFirst && !(options.autoExpandDepth>0)){
     startingJob = false;
-    return res.status(400).json({error:'No direct URLs and no crawl/auto-expand requested'});
+    return res.status(400).json({error:'No valid direct URLs (http/https) and no crawl/auto-expand requested'});
   }
 
   const primaryForId =
@@ -463,8 +482,27 @@ app.post('/api/run',(req,res)=>{
   const dir=path.join(BASE,id);
   fs.mkdirSync(dir,{recursive:true});
 
-  const autoDepth = parseInt(options.autoExpandDepth || 0,10);
-  const autoMax = parseInt(options.autoExpandMaxPages || 0,10) || 200;
+  // Smart defaults: if user pasted a single main URL and did not opt into crawlFirst,
+  // auto-expand to depth 3 and include product pages, so the copy is broadly browsable by default.
+  // We keep a reasonable page cap to avoid runaway crawls.
+  let autoDepth = parseInt(options.autoExpandDepth || 0,10);
+  let autoMax = parseInt(options.autoExpandMaxPages || 0,10) || 200;
+  if (!crawlFirst && (!autoDepth || autoDepth <= 0) && directURLs.length === 1) {
+    try {
+      const u = new URL(directURLs[0]);
+      // Heuristic: treat top-level homepage or site root as “main URL” and enable auto-expand
+      const isLikelyRoot = (u.pathname === '/' || u.pathname.split('/').filter(Boolean).length <= 1);
+      if (isLikelyRoot) {
+        options.autoExpandDepth = options.autoExpandDepth || 3;
+        options.autoExpandIncludeProducts = (options.autoExpandIncludeProducts !== false); // default true
+        options.autoExpandSubdomains = (options.autoExpandSubdomains !== false); // default true
+        options.autoExpandSameHostOnly = (options.autoExpandSameHostOnly !== false); // default true
+        options.autoExpandMaxPages = options.autoExpandMaxPages || 500; // safe-but-generous cap
+        autoDepth = 3;
+        autoMax = 500;
+      }
+    } catch {}
+  }
 
   runs.push({ id, dir, seedsFile:null, startedAt:Date.now(), stats:null, stopped:false, pending:true });
 
@@ -482,11 +520,13 @@ app.post('/api/run',(req,res)=>{
       INCLUDE_SUBDOMAINS: options.autoExpandSubdomains===false?'false':'true',
       ALLOW_REGEX: options.autoExpandAllowRegex || '',
       DENY_REGEX: options.autoExpandDenyRegex || '',
+      // Prefer product-like slugs so product pages are crawled early
+      PREFER_REGEX: options.autoExpandPreferRegex || '/[a-z0-9-]*[0-9][a-z0-9-]*\\.html$',
       WAIT_AFTER_LOAD: String(crawlOptions.waitAfterLoad || 500),
       NAV_TIMEOUT: String(crawlOptions.navTimeout || 15000),
       PAGE_TIMEOUT: String(crawlOptions.pageTimeout || 45000),
-      // Force pages-only discovery; suppress product auto-allow in crawler (if supported)
-      DISABLE_AUTO_ALLOW: 'true'
+      // Control product inclusion in auto-expand: default was pages-only; honor UI flag
+      DISABLE_AUTO_ALLOW: options.autoExpandIncludeProducts ? 'false' : 'true'
     };
     const crawlChild=spawn('node',[CRAWLER],{ env });
     currentChildProc=crawlChild;
@@ -575,7 +615,7 @@ app.post('/api/run',(req,res)=>{
   startingJob = false;
   push(`[JOB_START] id=${id} direct urls=${directURLs.length}`);
   launchArchiver(id, dir, seedsFile, options, rec?rec.startedAt:Date.now());
-  res.json({ ok:true, runId:id, dir, crawling:false });
+  res.json({ ok:true, runId:id, dir, crawling:false, accepted: directURLs.length, skipped: normRes.skipped });
 });
 
 /* ---------- Delete Run ---------- */
@@ -710,6 +750,26 @@ function loadManifest(runId){
   const run=findRun(runId);
   if(!run) return null;
   const fp=path.join(run.dir,'manifest.json');
+      // Smart defaults for direct capture (no crawl/auto-expand): aim for identical page without manual toggles
+      try{
+        const o = options || (options = {});
+        const setIfUndef = (key, val) => { if (!(key in o) || o[key] === undefined || o[key] === null) o[key] = val; };
+        setIfUndef('includeCrossOrigin', true);
+        setIfUndef('mirrorSubdomains', true);
+        setIfUndef('rewriteInternal', true);
+        setIfUndef('rewriteHtmlAssets', true);
+        setIfUndef('preserveAssetPaths', true);
+        // Give the page time to finish late assets and lazy-loaders
+        setIfUndef('waitExtra', 1200);
+        setIfUndef('quietMillis', 2000);
+        setIfUndef('maxCaptureMs', 30000);
+        // Trigger some lazy content without over-scrolling
+        setIfUndef('scrollPasses', 2);
+        setIfUndef('scrollDelay', 250);
+        // Inline tiny images to avoid request churn
+        setIfUndef('inlineSmallAssets', 2048);
+        // Keep headless (GUI controls headless separately); engine defaults are okay
+      }catch(e){ push('[SMART_DEFAULTS_ERR] '+e.message); }
   if(!fs.existsSync(fp)) return null;
   try { return JSON.parse(fs.readFileSync(fp,'utf8')); } catch { return null; }
 }

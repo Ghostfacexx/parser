@@ -48,10 +48,16 @@ function guessExt(url,ct){
   if(/pdf/i.test(ct)) return '.pdf';
   return '.bin';
 }
-function isLikelyAsset(u,ct){
-  if(/\.(png|jpe?g|webp|gif|svg|css|js|mjs|cjs|woff2?|ttf|otf|pdf)$/i.test(u)) return true;
-  if(/^(image|font|application\/pdf)/i.test(ct)) return true;
-  if(/css/i.test(ct) || /javascript|ecmascript/i.test(ct)) return true;
+function isLikelyAsset(u, ct, rt){
+  const url = u || '';
+  const ctype = (ct || '').toLowerCase();
+  if(/\.(png|jpe?g|webp|gif|svg|css|js|mjs|cjs|woff2?|ttf|otf|pdf)$/i.test(url)) return true;
+  if(/^(image|font|application\/pdf)/i.test(ctype)) return true;
+  if(/css/i.test(ctype) || /javascript|ecmascript/i.test(ctype)) return true;
+  // JSON APIs for product data
+  if(/application\/(json|ld\+json)|text\/(json)/i.test(ctype)) return true;
+  // Some sites return HTML snippets via XHR/fetch for quick views; store small HTML fetched via XHR
+  if((rt==='xhr' || rt==='fetch') && /text\/html/i.test(ctype)) return true;
   return false;
 }
 
@@ -73,6 +79,7 @@ const ROTATE_SESSION=envB('ROTATE_SESSION',false);
 const DISABLE_HTTP2=envB('DISABLE_HTTP2',false);
 const RAW_ONLY=envB('RAW_ONLY',false);
 const RETRIES=envN('RETRIES',1);
+const RETRY_BACKOFF_MS=envN('RETRY_BACKOFF_MS',500);
 const ALT_USER_AGENTS=(process.env.ALT_USER_AGENTS||'').split(',').map(s=>s.trim()).filter(Boolean);
 const DOMAIN_FILTER_ENV=process.env.DOMAIN_FILTER||'';
 const REWRITE_INTERNAL=envB('REWRITE_INTERNAL',true);
@@ -396,6 +403,18 @@ function injectOfflineFallbackShim(html, assetIndex, baseOrigin) {
     return MAP[noQ] || null;
   };
 
+  const asGet = (init)=>{
+    try{
+      const i = Object.assign({}, init||{});
+      i.method = 'GET';
+      if ('body' in i) delete i.body;
+      if (i.headers){
+        try{ const h = new Headers(i.headers); h.delete('content-type'); i.headers = h; }catch{}
+      }
+      return i;
+    }catch{ return undefined; }
+  };
+
   // fetch
   const origFetch = window.fetch ? window.fetch.bind(window) : null;
   if (origFetch) {
@@ -404,17 +423,17 @@ function injectOfflineFallbackShim(html, assetIndex, baseOrigin) {
       const local = lookup(url);
       // Prefer local if we have a mapping to avoid tripping origin edge logic
       if (local) {
-        try { return await origFetch(local, init); } catch(e) { /* fall through to network */ }
+        try { return await origFetch(local, asGet(init)); } catch(e) { /* fall through to network */ }
       }
       try {
         const res = await origFetch(input, init);
         if (!res || (res.status >= 400 && local)) {
-          try { return await origFetch(local, init); } catch(_) {}
+          try { return await origFetch(local, asGet(init)); } catch(_) {}
         }
         return res;
       } catch(err) {
         if (local) {
-          try { return await origFetch(local, init); } catch(_) {}
+          try { return await origFetch(local, asGet(init)); } catch(_) {}
         }
         throw err;
       }
@@ -800,107 +819,108 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
   }
 
   const proxy=nextProxy(pageNum);
-  let browser,context,page;
-  let inflight=0;
-  let lastActivity=Date.now();
-  function activity(){ lastActivity=Date.now(); }
-
-  try{
-    browser=await createBrowser(proxy);
-    context=await browser.newContext({
-      userAgent:chooseUA(profile),
-      viewport:profile.viewport,
-      deviceScaleFactor:profile.deviceScaleFactor||1,
-      isMobile:profile.isMobile||false,
-      hasTouch:profile.hasTouch||false,
-      locale:'en-US'
-    });
-    if (STEALTH) { try { await applyStealth(context); } catch {} }
-
-    page=await context.newPage();
-    page.setDefaultNavigationTimeout(NAV_TIMEOUT);
-
-    page.on('request',req=>{
-      inflight++; activity();
-      if(shouldSkipDownloadUrl(req.url()) && req.resourceType()==='document'){
-        try{ req.abort(); }catch{} inflight--;
-      }
-    });
-    const dec=()=>{ inflight=Math.max(0,inflight-1); activity(); };
-    page.on('requestfinished',dec);
-    page.on('requestfailed',dec);
-
-    page.on('response',resp=>{
-      activity();
-      const rq=resp.request();
-      const rUrl=rq.url();
-      const ct=(resp.headers()['content-type']||'').toLowerCase();
-      if(!isLikelyAsset(rUrl,ct)) return;
-      if(!INCLUDE_CROSS){
-        try { if(!isSameSite(rUrl)) return; } catch {}
-      }
-      if(sharedAssetIndex.has(rUrl)) return;
-      resp.body().then(buf=>{
-        if(buf.length>ASSET_MAX_BYTES) return;
-        if(INLINE_SMALL_ASSETS>0 && buf.length<=INLINE_SMALL_ASSETS && /^image\//i.test(ct)){
-          sharedAssetIndex.set(rUrl,{rewriteTo:`data:${ct};base64,${buf.toString('base64')}`,inlineDataUri:true});
-          return;
-        }
-        const { localPath:lp, rewriteTo }=decideAssetLocalPath(rUrl, url);
-        const full=path.join(outRoot,lp); ensureDir(path.dirname(full));
-        if(!(PROFILE_ASSET_DEDUP && fs.existsSync(full))){
-          fs.writeFileSync(full,buf);
-        }
-        sharedAssetIndex.set(rUrl,{localPath:lp,rewriteTo});
-      }).catch(()=>{});
-    });
-
-    let resp;
+  let attemptError=null;
+  for(let attempt=1; attempt<=RETRIES; attempt++){
+    let browser,context,page; // re-created per attempt for stability
+    let inflight=0; let lastActivity=Date.now();
+    function activity(){ lastActivity=Date.now(); }
     try{
-      resp=await page.goto(url,{waitUntil:PAGE_WAIT_UNTIL, timeout:NAV_TIMEOUT});
-    }catch(navErr){
-      record.reasons.push('navAttempt:'+navErr.message);
-      throw navErr;
-    }
-    record.mainStatus=resp?.status()||null;
-    record.finalURL=resp?.url()||page.url();
-    try{ await page.waitForSelector('body',{timeout:10000}); }catch{ record.reasons.push('noBody'); }
+      browser=await createBrowser(proxy);
+      context=await browser.newContext({
+        userAgent:chooseUA(profile),
+        viewport:profile.viewport,
+        deviceScaleFactor:profile.deviceScaleFactor||1,
+        isMobile:profile.isMobile||false,
+        hasTouch:profile.hasTouch||false,
+        locale:'en-US'
+      });
+      if (STEALTH) { try { await applyStealth(context); } catch {} }
 
-    for(const sel of CLICK_SELECTORS){
-      if(!sel) continue;
-      try{ const el=await page.$(sel); if(el){ await el.click(); await page.waitForTimeout(150);} }catch{}
-    }
+      page=await context.newPage();
+      page.setDefaultNavigationTimeout(NAV_TIMEOUT);
 
-    const consent=await attemptConsent(page);
-    if(consent.clicked && FORCE_CONSENT_WAIT_MS>0) await page.waitForTimeout(FORCE_CONSENT_WAIT_MS);
+      page.on('request',req=>{
+        inflight++; activity();
+        if(shouldSkipDownloadUrl(req.url()) && req.resourceType()==='document'){
+          try{ req.abort(); }catch{} inflight--;
+        }
+      });
+      const dec=()=>{ inflight=Math.max(0,inflight-1); activity(); };
+      page.on('requestfinished',dec);
+      page.on('requestfailed',dec);
 
-    try{ await handlePopups(page); }catch(e){ record.reasons.push('popupErr:'+e.message); }
+      page.on('response',resp=>{
+        activity();
+        const rq=resp.request();
+        const rUrl=rq.url();
+        const ct=(resp.headers()['content-type']||'').toLowerCase();
+        const rt = (typeof rq.resourceType === 'function') ? rq.resourceType() : '';
+        if(!isLikelyAsset(rUrl,ct,rt)) return;
+        if(!INCLUDE_CROSS){
+          try { if(!isSameSite(rUrl)) return; } catch {}
+        }
+        if(sharedAssetIndex.has(rUrl)) return;
+        resp.body().then(buf=>{
+          if(buf.length>ASSET_MAX_BYTES) return;
+            if(INLINE_SMALL_ASSETS>0 && buf.length<=INLINE_SMALL_ASSETS && /^image\//i.test(ct)){
+              sharedAssetIndex.set(rUrl,{rewriteTo:`data:${ct};base64,${buf.toString('base64')}`,inlineDataUri:true});
+              return;
+            }
+            const { localPath:lp, rewriteTo }=decideAssetLocalPath(rUrl, url);
+            const full=path.join(outRoot,lp); ensureDir(path.dirname(full));
+            if(!(PROFILE_ASSET_DEDUP && fs.existsSync(full))){
+              fs.writeFileSync(full,buf);
+            }
+            sharedAssetIndex.set(rUrl,{localPath:lp,rewriteTo});
+        }).catch(()=>{});
+      });
 
-    if(REMOVE_SELECTORS.length){
+      let resp;
       try{
-        await page.evaluate(sels=>{
-          sels.forEach(s=>document.querySelectorAll(s).forEach(n=>n.remove()));
-        }, REMOVE_SELECTORS);
-      }catch{}
-    }
+        resp=await page.goto(url,{waitUntil:PAGE_WAIT_UNTIL, timeout:NAV_TIMEOUT});
+      }catch(navErr){
+        record.reasons.push('navAttempt:'+navErr.message);
+        throw navErr;
+      }
+      record.mainStatus=resp?.status()||null;
+      record.finalURL=resp?.url()||page.url();
+      try{ await page.waitForSelector('body',{timeout:10000}); }catch{ record.reasons.push('noBody'); }
 
-    for(let i=0;i<SCROLL_PASSES;i++){
-      try{
-        await page.evaluate(()=>{ const s=document.scrollingElement||document.documentElement; if(s) s.scrollBy(0,s.scrollHeight); });
-      }catch{}
-      await page.waitForTimeout(SCROLL_DELAY);
-    }
+      for(const sel of CLICK_SELECTORS){
+        if(!sel) continue;
+        try{ const el=await page.$(sel); if(el){ await el.click(); await page.waitForTimeout(150);} }catch{}
+      }
 
-    if(WAIT_EXTRA>0) await page.waitForTimeout(WAIT_EXTRA);
+      const consent=await attemptConsent(page);
+      if(consent.clicked && FORCE_CONSENT_WAIT_MS>0) await page.waitForTimeout(FORCE_CONSENT_WAIT_MS);
 
-    const capDeadline=Date.now()+MAX_CAPTURE_MS;
-    while(Date.now()<capDeadline){
-      const quiet=(Date.now()-lastActivity)>=QUIET_MILLIS && inflight===0;
-      if(quiet) break;
-      await page.waitForTimeout(300);
-    }
+      try{ await handlePopups(page); }catch(e){ record.reasons.push('popupErr:'+e.message); }
 
-    let html=await page.content();
+      if(REMOVE_SELECTORS.length){
+        try{
+          await page.evaluate(sels=>{
+            sels.forEach(s=>document.querySelectorAll(s).forEach(n=>n.remove()));
+          }, REMOVE_SELECTORS);
+        }catch{}
+      }
+
+      for(let i=0;i<SCROLL_PASSES;i++){
+        try{
+          await page.evaluate(()=>{ const s=document.scrollingElement||document.documentElement; if(s) s.scrollBy(0,s.scrollHeight); });
+        }catch{}
+        await page.waitForTimeout(SCROLL_DELAY);
+      }
+
+      if(WAIT_EXTRA>0) await page.waitForTimeout(WAIT_EXTRA);
+
+      const capDeadline=Date.now()+MAX_CAPTURE_MS;
+      while(Date.now()<capDeadline){
+        const quiet=(Date.now()-lastActivity)>=QUIET_MILLIS && inflight===0;
+        if(quiet) break;
+        await page.waitForTimeout(300);
+      }
+
+      let html=await page.content();
 
     // Inject mobile meta viewport if mobile & missing
     if(profile.isMobile && INJECT_MOBILE_META){
@@ -913,7 +933,7 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
       }catch{}
     }
 
-    if(REWRITE_INTERNAL){
+      if(REWRITE_INTERNAL){
       try{
         const baseUrl=page.url();
         const baseOrigin=(()=>{ try{return new URL(baseUrl).origin;}catch{return '';} })();
@@ -934,21 +954,29 @@ async function captureProfile(pageNum,url,outRoot,rel,profile,sharedAssetIndex){
       }catch(e){ record.reasons.push('rewriteInternalErr:'+e.message); }
     }
 
-    if(REWRITE_HTML_ASSETS){
+      if(REWRITE_HTML_ASSETS){
       try{ html=rewriteHTML(html,sharedAssetIndex); }catch(e){ record.reasons.push('assetRewriteErr:'+e.message); }
     }
 
     // Inject offline fallback shim (preserves app logic; only falls back when live fails)
-    try { html = injectOfflineFallbackShim(html, sharedAssetIndex, page.url()); } catch {}
+      try { html = injectOfflineFallbackShim(html, sharedAssetIndex, page.url()); } catch {}
 
-    ensureDir(pageDir);
-    fs.writeFileSync(path.join(pageDir,'index.html'), html,'utf8');
+      ensureDir(pageDir);
+      fs.writeFileSync(path.join(pageDir,'index.html'), html,'utf8');
 
-    await browser.close();
-  }catch(e){
-    record.status='error:nav '+e.message;
-    record.reasons.push('attemptFail:'+e.message);
-    try{ if(browser) await browser.close(); }catch{}
+      try{ await browser.close(); }catch{}
+      attemptError=null; // success
+      break; // exit retry loop
+    }catch(e){
+      attemptError=e;
+      record.status='error:nav '+e.message;
+      record.reasons.push('attemptFail:'+e.message+(attempt<RETRIES?':retrying':''));
+      try{ if(browser) await browser.close(); }catch{}
+      if(attempt<RETRIES){
+        await new Promise(r=>setTimeout(r, RETRY_BACKOFF_MS));
+        continue; // retry
+      }
+    }
   }
 
   if((!record.mainStatus || record.status.startsWith('error')) && !record.rawUsed){

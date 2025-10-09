@@ -39,7 +39,7 @@
   // ---------- Runs
   function renderRuns(list){
     runsBody.innerHTML = (list||[]).map(r=>{
-      const pages = r.stats?.pages ?? r.stats?.pagesCrawled ?? (r.pending?'…':'-');
+      const pages = r.stats?.pages ?? r.stats?.pagesCrawled ?? (r.pending?'ï¿½':'-');
       const fails = r.stats?.failures ?? 0;
       const assets = r.stats?.assets ?? '-';
       return `<tr data-run="${r.id}" class="${r.pending?'pending':''}">
@@ -79,6 +79,7 @@
       opts.autoExpandMaxPages = asNum(id('autoMaxPages'),120);
       opts.autoExpandSameHostOnly = asBool(id('autoSameHost'));
       opts.autoExpandSubdomains = asBool(id('autoSubs'));
+      opts.autoExpandIncludeProducts = asBool(id('autoIncludeProducts'));
       const allow = asStr(id('autoAllow')); if(allow) opts.autoExpandAllowRegex = allow;
       const deny = asStr(id('autoDeny'));   if(deny)  opts.autoExpandDenyRegex  = deny;
     }
@@ -203,6 +204,80 @@
     }).catch(e=>logHost('Stop host error '+e.message));
   };
 
+  // Host details (pages and subdomains)
+  const hostDetailsBtn = id('btnHostDetails');
+  if (hostDetailsBtn){
+    hostDetailsBtn.onclick = ()=>{
+      const runId = id('hostRun')?.value?.trim();
+      if(!runId){ logHost('No run selected'); return; }
+      Promise.all([
+        fetch(`/api/manifest?id=${encodeURIComponent(runId)}`).then(r=> r.ok ? r.json() : Promise.reject(new Error('manifest not found'))),
+        fetch('/api/hosts').then(r=> r.ok ? r.json() : { hosts: [] }).catch(()=>({ hosts: [] }))
+      ]).then(([mf, hosts])=>{
+        try{
+          const recs = Array.isArray(mf) ? mf : [];
+          const desktop = recs.filter(r=>r && r.profile==='desktop');
+          const paths = desktop.map(r=> r.relPath || 'index');
+          const origins = new Set();
+          recs.forEach(r=>{ try{ origins.add(new URL(r.url).hostname); }catch{} });
+          const hostEntry = (hosts && hosts.hosts || []).find(h=> String(h.runId) === String(runId));
+          const base = hostEntry ? (window.location.protocol + '//' + window.location.hostname + ':' + hostEntry.port) : '';
+          const list = paths.slice(0,1000).map(p=>{
+            const pathPart = '/' + (p==='index' ? '' : (p.replace(/^\/+/, '') + '/'));
+            const href = base ? (base + pathPart) : pathPart;
+            return `<li><a href="${href}" target="_blank">${href}</a></li>`;
+          }).join('');
+          id('hostDetails').innerHTML = `
+            <div class="badge">pages: ${paths.length}</div>
+            <div class="small">subdomains: ${[...origins].sort().join(', ') || '-'}</div>
+            <div class="small">host: ${hostEntry ? (window.location.hostname + ':' + hostEntry.port) : '(not started)'}</div>
+            <details style="margin-top:.3rem"><summary>Browsable paths</summary><ul>${list}</ul></details>
+          `;
+        }catch(e){ id('hostDetails').textContent = 'Error building details: '+e.message; }
+      }).catch(e=>{ id('hostDetails').textContent = 'Error: '+e.message; });
+    };
+  }
+
+  // Analyze pages (page-map)
+  const hostAnalyzeBtn = id('btnHostAnalyze');
+  if (hostAnalyzeBtn){
+    hostAnalyzeBtn.onclick = ()=>{
+      const runId = id('hostRun')?.value?.trim();
+      if(!runId){ logHost('No run selected'); return; }
+      fetch(`/api/page-map?runId=${encodeURIComponent(runId)}`)
+        .then(r=> r.ok ? r.json() : Promise.reject(new Error('page-map failed')))
+        .then(js=>{
+          try{
+            const map = js.map || {};
+            const counts = map.counts || {};
+            const base = window.location.origin;
+            function listToHtml(arr){
+              return (arr||[]).slice(0,200).map(x=>{
+                const href = (x && x.url) ? x.url : '';
+                let pathPart = '/';
+                try { const u = new URL(href); pathPart = u.pathname.endsWith('/') ? u.pathname : (u.pathname + '/'); } catch {}
+                const full = base + pathPart;
+                const title = x && x.title ? x.title : pathPart;
+                return `<li><a href="${full}" target="_blank">${title}</a></li>`;
+              }).join('');
+            }
+            id('hostDetails').innerHTML = `
+              <div class="badge">seeds: ${counts.seeds||0}</div>
+              <div class="badge">home: ${counts.home||0}</div>
+              <div class="badge">categories: ${counts.categories||0}</div>
+              <div class="badge">information: ${counts.information||0}</div>
+              <div class="badge">others: ${counts.others||0}</div>
+              <details style="margin-top:.3rem"><summary>Home</summary><ul>${listToHtml(map.home)}</ul></details>
+              <details><summary>Categories</summary><ul>${listToHtml(map.categories)}</ul></details>
+              <details><summary>Information</summary><ul>${listToHtml(map.information)}</ul></details>
+              <details><summary>Others</summary><ul>${listToHtml(map.others)}</ul></details>
+            `;
+          }catch(e){ id('hostDetails').textContent = 'Analyze error: '+e.message; }
+        })
+        .catch(e=>{ id('hostDetails').textContent = 'Analyze call failed: '+e.message; });
+    };
+  }
+
   // ---------- Hosting Prep
   function loadPlatforms(){
     fetchJSON('/api/hosting-presets').then(j=>{
@@ -213,7 +288,7 @@
   id('btnSuggest').onclick=()=>{
     if(!selectedRun) return logHP('No run selected');
     fetchJSON('/api/runs/'+selectedRun+'/prepare-suggestions').then(s=>{
-      logHP('Suggest: pages='+s.pages+' mobile='+s.hasMobile+' assets˜'+s.totalAssetsApprox+' analytics='+s.analyticsMatches);
+      logHP('Suggest: pages='+s.pages+' mobile='+s.hasMobile+' assetsï¿½'+s.totalAssetsApprox+' analytics='+s.analyticsMatches);
       id('hpMobile').checked=s.hasMobile;
       if(s.recommendations.stripAnalytics) id('hpStrip').checked=true;
       if(s.recommendations.precompress) id('hpCompress').checked=true;

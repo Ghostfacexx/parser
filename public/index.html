@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Archiver – Stable UI + Advanced</title>
+<title>Archiver ï¿½ Stable UI + Advanced</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <!-- MARKER: MINIMAL_UI_V2_ADV -->
 <style>
@@ -41,7 +41,7 @@ summary{cursor:pointer;font-weight:600}
 </style>
 </head>
 <body>
-<header><h1>Archiver – Stable UI + Advanced</h1></header>
+<header><h1>Archiver ï¿½ Stable UI + Advanced</h1></header>
 <main>
 
 <section>
@@ -209,6 +209,11 @@ summary{cursor:pointer;font-weight:600}
     <button id="btnHost">Host</button>
     <button id="btnStopHost" class="secondary" disabled>Stop</button>
   </div>
+  <div class="flex" style="margin-top:.4rem">
+    <button id="btnHostDetails" class="secondary">Show Details</button>
+    <button id="btnHostAnalyze" class="secondary">Analyze Pages</button>
+  </div>
+  <div id="hostDetails" class="small"></div>
   <pre id="hostLog"></pre>
 </section>
 
@@ -243,6 +248,7 @@ summary{cursor:pointer;font-weight:600}
     </div>
   </fieldset>
   <pre id="hpLog"></pre>
+        <label class="opt"><input type="checkbox" id="autoIncludeProducts">include product pages</label>
   <div id="jobsTableWrapper">
     <table id="jobsTable">
       <thead><tr><th>ID</th><th>Status</th><th>ZIP</th><th>Run</th><th></th></tr></thead>

@@ -90,6 +90,10 @@ const ALLOW_REGEX_STR   = process.env.ALLOW_REGEX || '';
 const DENY_REGEX_STR    = process.env.DENY_REGEX || '';
 const KEEP_QUERY_PARAMS = (process.env.KEEP_QUERY_PARAMS||'').split(',').map(s=>s.trim()).filter(Boolean);
 const STRIP_ALL_QUERIES = flag('STRIP_ALL_QUERIES', false);
+// Prefer certain URLs (e.g., product detail pages) by regex; preferred URLs are queued ahead of others
+// Additionally allow a CATEGORY_PREFER_REGEX to ensure category/listing pages are crawled before product pages.
+const PREFER_REGEX_STR  = process.env.PREFER_REGEX || '';
+const CATEGORY_PREFER_REGEX_STR = process.env.CATEGORY_PREFER_REGEX || '';
 const WAIT_AFTER_LOAD   = parseInt(process.env.WAIT_AFTER_LOAD||'500',10);
 const NAV_TIMEOUT       = parseInt(process.env.NAV_TIMEOUT||'15000',10);
 const PAGE_TIMEOUT      = parseInt(process.env.PAGE_TIMEOUT||'45000',10); // (placeholder)
@@ -108,6 +112,18 @@ if (ALLOW_REGEX_STR){
 }
 if (DENY_REGEX_STR){
   try { denyRx = new RegExp(DENY_REGEX_STR,'i'); } catch(e){ console.error('Invalid DENY_REGEX', e.message); }
+}
+let preferRx=null, categoryPreferRx=null;
+if (PREFER_REGEX_STR){
+  try { preferRx = new RegExp(PREFER_REGEX_STR,'i'); } catch(e){ console.error('Invalid PREFER_REGEX', e.message); }
+} else {
+  try { preferRx = new RegExp('/[a-z0-9-]*[0-9][a-z0-9-]*\\.html$', 'i'); } catch { preferRx=null; }
+}
+if (CATEGORY_PREFER_REGEX_STR){
+  try { categoryPreferRx = new RegExp(CATEGORY_PREFER_REGEX_STR,'i'); } catch(e){ console.error('Invalid CATEGORY_PREFER_REGEX', e.message); }
+} else {
+  // Heuristic: catalog or category listing pages often contain '-catalog-' or '-category-' fragments or 'catalog-details'. Adjust as needed.
+  try { categoryPreferRx = new RegExp('/(catalog|category)[-a-z0-9]*\\.html$', 'i'); } catch { categoryPreferRx=null; }
 }
 
 /* Proxy rotation */
@@ -197,6 +213,31 @@ async function crawl(){
   const rootHost=(()=>{ try { return new URL(rootURL).hostname; } catch { return ''; }})();
 
   const queue=[];               // BFS queue: {url, depth}
+  // Helper to enqueue with 3-tier preference: category > product > normal
+  function enqueuePreferred(item){
+    if (!item || !item.url) return;
+    const u=item.url;
+    const isCategory = categoryPreferRx ? categoryPreferRx.test(u) : false;
+    const isProduct = !isCategory && (preferRx ? preferRx.test(u) : false);
+    if (isCategory){
+      // Put at absolute front
+      queue.unshift(item);
+    } else if (isProduct){
+      // Insert after any existing category-priority items but before normal ones.
+      let insertAt = 0;
+      // find first non-category (since categories may already be at front)
+      for(let i=0;i<queue.length;i++){
+        const q=queue[i];
+        if(!(categoryPreferRx && categoryPreferRx.test(q.url))){
+          insertAt = i; break;
+        }
+        insertAt = i+1; // all front items are categories
+      }
+      queue.splice(insertAt,0,item);
+    } else {
+      queue.push(item);
+    }
+  }
   const seen=new Set();         // all normalized URLs ever seen (discovered)
   const visitedOrder=[];        // order of ACTUAL FETCHES (pages we opened) -> seeds for archiver
   const depths=new Map();       // url -> depth (for graph)
@@ -207,7 +248,7 @@ async function crawl(){
     if(n && !seen.has(n)){
       seen.add(n);
       depths.set(n,0);
-      queue.push({url:n, depth:0});
+  enqueuePreferred({url:n, depth:0});
     }
   });
 
@@ -252,7 +293,7 @@ async function crawl(){
             depths.set(norm,d);
             // Enqueue only if we still can fetch more pages and depth within limit
             if (d <= MAX_DEPTH && visitedOrder.length < MAX_PAGES){
-              queue.push({ url:norm, depth:d });
+              enqueuePreferred({ url:norm, depth:d });
             }
           }
         }
