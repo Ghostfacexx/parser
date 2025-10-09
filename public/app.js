@@ -360,6 +360,7 @@
   // Live stats state
   const liveStatsEl = id('liveStats');
   const liveStatsDetail = id('liveStatsDetail');
+  const progressBarsEl = id('progressBars');
   const stat = {
     planHash:'', planCats:0, planProducts:0, planReused:false,
     pagesCrawled:0, pagesDiscovered:0,
@@ -380,7 +381,27 @@
       ['Last', stat.lastEvent?new Date(stat.lastEvent).toLocaleTimeString():'-']
     ];
       liveStatsEl.innerHTML = items.map(([k,v])=>`<div style="flex:0 0 auto;background:linear-gradient(135deg,#0a57ff,#0846cc);color:#fff;padding:.45rem .6rem;border-radius:10px;min-width:92px;box-shadow:0 2px 4px rgba(0,0,0,.15);display:flex;flex-direction:column;justify-content:center;align-items:center"><div style="font-size:.55rem;letter-spacing:.5px;text-transform:uppercase;opacity:.85">${k}</div><div style="font-weight:600;font-size:.78rem;margin-top:.15rem">${v}</div></div>`).join('');
+      renderProgress();
   }
+    function pct(cur,max){ if(!max||max<=0) return 0; return Math.min(100, Math.round((cur/max)*100)); }
+    function barHTML(label, cur, max, color){
+      const p = pct(cur,max);
+      const disp = max?`${cur}/${max}`:cur;
+      return `<div style="display:flex;flex-direction:column;gap:.15rem">
+        <div style="display:flex;justify-content:space-between;font-size:.58rem;font-weight:600;color:#333"><span>${label}</span><span>${disp} ${max?`(${p}% )`:''}</span></div>
+        <div style="background:#e2e8f0;border-radius:6px;overflow:hidden;height:9px;position:relative">
+          <div style="width:${p}%;background:${color};height:100%;transition:width .3s ease"></div>
+        </div>
+      </div>`;
+    }
+    function renderProgress(){
+      if(!progressBarsEl) return;
+      // Planned products vs crawled heuristic products
+      const productsBar = barHTML('Products', stat.productsCrawled, stat.planProducts||0, 'linear-gradient(90deg,#ff9800,#ffb74d)');
+      const categoriesBar = barHTML('Categories (planned)', stat.categoriesCrawled, stat.planCats||0, 'linear-gradient(90deg,#4caf50,#81c784)');
+      const pagesBar = barHTML('Pages Crawled', stat.pagesCrawled, stat.pagesDiscovered||0, 'linear-gradient(90deg,#2196f3,#64b5f6)');
+      progressBarsEl.innerHTML = productsBar + categoriesBar + pagesBar;
+    }
   function handleLiveLine(line){
     // PLAN lines
     let m;
