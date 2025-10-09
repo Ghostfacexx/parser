@@ -355,4 +355,29 @@
 
   // ---------- Init
   loadRuns(); loadPlatforms(); refreshJobs(); logCap('Init complete (advanced)');
+
+  // ---------- Plan Preview
+  const planBtn = id('btnLoadPlan');
+  if(planBtn){
+    planBtn.onclick = ()=>{
+      const explicit = asStr(id('planRunId'));
+      const runId = explicit || selectedRun;
+      if(!runId){ logCap('Plan load: select run first'); return; }
+      id('planPreview').textContent='Loading plan...';
+      fetch('/api/plan?runId='+encodeURIComponent(runId))
+        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .then(j=>{
+          const p=j.plan||{};
+            const cats=p.categories||[]; const prods=p.productList||[];
+            const catProducts=p.categoryProducts||{};
+            const lines=[];
+            lines.push('Hash: '+(j.hash||''));
+            lines.push('Categories: '+cats.length+' Products: '+prods.length+' Groups:'+Object.keys(catProducts).length);
+            cats.slice(0,200).forEach((c,i)=>{ lines.push(`CAT[${i}] ${c} products=${(catProducts[c]||[]).length}`); });
+            prods.slice(0,300).forEach((u,i)=>{ lines.push(`PROD[${i}] ${u}`); });
+            id('planPreview').textContent=lines.join('\n');
+        })
+        .catch(e=>{ id('planPreview').textContent='Plan load error: '+e.message; });
+    };
+  }
 })();

@@ -285,7 +285,8 @@ app.post('/api/crawl',(req,res)=>{
     baseDir: BASE,
     stripWWW: String(process.env.RUN_ID_STRIP_WWW || 'true').toLowerCase() !== 'false'
   });
-  const dir=path.join(BASE,id);
+  const testingMode = !!options.testingMode || !!process.env.TESTING_MODE;
+  const dir = testingMode ? path.join(BASE,'testing',id) : path.join(BASE,id);
   fs.mkdirSync(dir,{recursive:true});
 
   const env={
@@ -643,6 +644,49 @@ app.post('/api/delete-run',(req,res)=>{
   runs.splice(idx,1);
   push('[DELETE_RUN] '+runId);
   res.json({ ok:true });
+});
+
+/* ---------- Plan endpoint ---------- */
+app.get('/api/plan',(req,res)=>{
+  try{
+    const { runId } = req.query||{};
+    if(!runId) return res.status(400).json({error:'runId required'});
+    const run=findRun(runId);
+    if(!run) return res.status(404).json({error:'run not found'});
+    // Plan file may reside in _profiles (cached) or inside run output directory
+    // We detect host from runId (derive similarly to seeds) by scanning seeds file first URL
+    let host='';
+    try{
+      const seedsFile = run.seedsFile || path.join(run.dir,'seeds.txt');
+      if(fs.existsSync(seedsFile)){
+        const first = (fs.readFileSync(seedsFile,'utf8').split(/\r?\n/).find(Boolean)||'').trim();
+        if(first) host=new URL(first).hostname;
+      }
+    }catch{}
+    const profilesDir = path.join(run.dir,'..','_profiles');
+    let plan=null;
+    if(host){
+      const profilePath = path.join(profilesDir, host + '.json');
+      if(fs.existsSync(profilePath)){
+        try{ plan=JSON.parse(fs.readFileSync(profilePath,'utf8')); }catch{}
+      }
+    }
+    // Fallback: look for plan.json inside run directory
+    if(!plan){
+      const planPath = path.join(run.dir,'plan.json');
+      if(fs.existsSync(planPath)){
+        try{ plan=JSON.parse(fs.readFileSync(planPath,'utf8')); }catch{}
+      }
+    }
+    if(!plan) return res.status(404).json({error:'plan not found'});
+    // Add derived stats
+    const stats={
+      categories: plan.categories?plan.categories.length:0,
+      products: plan.productList?plan.productList.length:0,
+      categoryProducts: plan.categoryProducts?Object.keys(plan.categoryProducts).length:0
+    };
+    res.json({ ok:true, hash:plan.hash||'', plan, stats });
+  }catch(e){ res.status(500).json({error:e.message}); }
 });
 
 /* ---------- Host controls ---------- */

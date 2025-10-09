@@ -241,6 +241,7 @@ async function crawl(){
         structurePlan = cached;
         console.log(`[PLAN_REUSE] host=${host} hash=${cached.hash} cats=${cached.categories?.length||0} products=${cached.productList?.length||0}`);
       } else {
+        console.log('[PLAN_START] full auto plan detection');
         structurePlan = await detectStructure({
           startUrls: START_URLS,
           outputDir: OUTPUT_DIR,
@@ -249,6 +250,7 @@ async function crawl(){
           globalProductCap: PLAN_GLOBAL_PRODUCT_CAP,
           timeoutMs: PLAN_TIMEOUT
         });
+        console.log('[PLAN_DONE] categories='+ (structurePlan?.categories?.length||0) +' products='+ (structurePlan?.productList?.length||0)+' hash='+(structurePlan?.hash||''));
         try { fs.writeFileSync(profilePath, JSON.stringify(structurePlan,null,2)); } catch(e){ console.error('profile write fail', e.message); }
       }
       if(structurePlan){
