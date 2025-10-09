@@ -72,6 +72,17 @@
     if(id('optPreserve').checked) opts.preserveAssetPaths=true;
     if(id('optScroll').checked) { opts.scrollPasses=2; }
 
+    // Deterministic / Full Auto modes
+    if(id('modeQuickDet')?.checked) opts.quickDeterministic = true;
+    if(id('modeFullAuto')?.checked) opts.fullAutoPlan = true;
+    if(id('modeReuseProfile')?.checked) opts.reuseDomainProfile = true;
+    if(id('modeForceRebuild')?.checked) opts.forceRebuildPlan = true;
+    const ppc = asNum(id('planProductsPerCat'),0); if(ppc>0) opts.planProductsPerCategory = ppc;
+    const pgc = asNum(id('planGlobalCap'),0); if(pgc>0) opts.planGlobalProductCap = pgc;
+    const pto = asNum(id('planTimeout'),0); if(pto>0) opts.planTimeoutMs = pto;
+    const qpc = asNum(id('quickPerCatQuota'),0); if(qpc>0) opts.quickPerCategoryQuota = qpc;
+    const qtc = asNum(id('quickTotalCap'),0); if(qtc>0) opts.quickTotalProductCap = qtc;
+
     // Auto-expand
     const adepth = asNum(id('autoDepth'),0);
     if(adepth>0){

@@ -383,7 +383,17 @@ function launchArchiver(id, dir, seedsFile, options, startedAt){
     PROFILES: options.profiles || process.env.PROFILES || 'desktop,mobile',
     SAME_SITE_MODE: options.sameSiteMode || process.env.SAME_SITE_MODE || 'etld',
     INTERNAL_HOSTS_REGEX: options.internalHostsRegex || process.env.INTERNAL_HOSTS_REGEX || '',
-    TARGET_PLATFORM: (options.targetPlatform || process.env.TARGET_PLATFORM || 'generic').toLowerCase()
+    TARGET_PLATFORM: (options.targetPlatform || process.env.TARGET_PLATFORM || 'generic').toLowerCase(),
+    // Deterministic / Plan modes
+    QUICK_DET_MODE: options.quickDeterministic ? 'true':'false',
+    FULL_AUTO_MODE: options.fullAutoPlan ? 'true':'false',
+    REUSE_DOMAIN_PROFILE: options.reuseDomainProfile===false?'false':'true',
+    FORCE_REBUILD_PLAN: options.forceRebuildPlan ? 'true':'false',
+    PLAN_PRODUCTS_PER_CATEGORY: String(options.planProductsPerCategory || ''),
+    PLAN_GLOBAL_PRODUCT_CAP: String(options.planGlobalProductCap || ''),
+    PLAN_TIMEOUT: String(options.planTimeoutMs || ''),
+    CATEGORY_PRODUCT_QUOTA: String(options.quickPerCategoryQuota || ''),
+    TOTAL_PRODUCT_CAP: String(options.quickTotalProductCap || '')
   };
   push(`[JOB_PHASE] archive start id=${id} target=${env.TARGET_PLATFORM}`);
   const child=spawn('node',[ARCHIVER,seedsFile,dir],{ env });

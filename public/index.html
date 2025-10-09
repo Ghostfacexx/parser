@@ -72,6 +72,23 @@ summary{cursor:pointer;font-weight:600}
   <details>
     <summary>Advanced capture settings</summary>
     <div class="group">
+      <h3>Deterministic & Full Auto Modes</h3>
+      <div class="row">
+        <label class="opt"><input type="checkbox" id="modeQuickDet">quick deterministic</label>
+        <label class="opt"><input type="checkbox" id="modeFullAuto">full auto plan</label>
+        <label class="opt"><input type="checkbox" id="modeReuseProfile" checked>reuse profile</label>
+        <label class="opt"><input type="checkbox" id="modeForceRebuild">force rebuild</label>
+      </div>
+      <div class="row">
+        <div class="col"><label>plan products / cat<input id="planProductsPerCat" type="number" value="10"></label></div>
+        <div class="col"><label>plan global cap<input id="planGlobalCap" type="number" value="120"></label></div>
+        <div class="col"><label>plan timeout(ms)<input id="planTimeout" type="number" value="15000"></label></div>
+      </div>
+      <div class="row">
+        <div class="col"><label>quick per-cat quota<input id="quickPerCatQuota" type="number" value="10"></label></div>
+        <div class="col"><label>quick total cap<input id="quickTotalCap" type="number" value="200"></label></div>
+      </div>
+      <div class="small">When Full Auto Plan enabled, the plan decides categories & products; quick mode provides lightweight deterministic ordering and quotas without deep analysis.</div>
       <div class="row">
         <div class="col">
           <label>Engine

@@ -113,23 +113,10 @@ const PLAN_PRODUCTS_PER_CATEGORY = parseInt(process.env.PLAN_PRODUCTS_PER_CATEGO
 const PLAN_GLOBAL_PRODUCT_CAP = parseInt(process.env.PLAN_GLOBAL_PRODUCT_CAP||'400',10);
 const PLAN_PROBE_CATEGORY_LIMIT = parseInt(process.env.PLAN_PROBE_CATEGORY_LIMIT||'40',10);
 const PLAN_TIMEOUT = parseInt(process.env.PLAN_TIMEOUT||'15000',10);
+const REUSE_DOMAIN_PROFILE = flag('REUSE_DOMAIN_PROFILE', true);
+const FORCE_REBUILD_PLAN = flag('FORCE_REBUILD_PLAN', false);
 
-let structurePlan = null;
-if (FULL_AUTO_MODE){
-  try {
-    const { detectStructure } = require('./lib/structure-detect.cjs');
-    structurePlan = detectStructure({
-      startUrls: START_URLS,
-      outputDir: OUTPUT_DIR,
-      probeCategoryLimit: PLAN_PROBE_CATEGORY_LIMIT,
-      productsPerCategory: PLAN_PRODUCTS_PER_CATEGORY,
-      globalProductCap: PLAN_GLOBAL_PRODUCT_CAP,
-      timeoutMs: PLAN_TIMEOUT
-    });
-  } catch(e){
-    console.error('[FULL_AUTO_MODE_ERR]', e.message);
-  }
-}
+let structurePlan = null; // loaded lazily inside crawl when FULL_AUTO_MODE
 
 /* Regex compile */
 let allowRx=null, denyRx=null;
@@ -238,6 +225,47 @@ async function crawl(){
   const rootURL=START_URLS[0];
   const rootHost=(()=>{ try { return new URL(rootURL).hostname; } catch { return ''; }})();
 
+  // Load full-auto plan first (synchronous await) so seeding & regex override happens before queue operations
+  if(FULL_AUTO_MODE){
+    try {
+      const { detectStructure } = require('./lib/structure-detect.cjs');
+      const domainProfileDir = path.join(OUTPUT_DIR,'..','_profiles');
+      ensureDir(domainProfileDir);
+      let host=''; try { host=new URL(rootURL).hostname; } catch{}
+      const profilePath = path.join(domainProfileDir, host + '.json');
+      let cached=null;
+      if(REUSE_DOMAIN_PROFILE && fs.existsSync(profilePath) && !FORCE_REBUILD_PLAN){
+        try { cached=JSON.parse(fs.readFileSync(profilePath,'utf8')); } catch { cached=null; }
+      }
+      if(cached){
+        structurePlan = cached;
+        console.log(`[PLAN_REUSE] host=${host} hash=${cached.hash} cats=${cached.categories?.length||0} products=${cached.productList?.length||0}`);
+      } else {
+        structurePlan = await detectStructure({
+          startUrls: START_URLS,
+          outputDir: OUTPUT_DIR,
+          probeCategoryLimit: PLAN_PROBE_CATEGORY_LIMIT,
+          productsPerCategory: PLAN_PRODUCTS_PER_CATEGORY,
+          globalProductCap: PLAN_GLOBAL_PRODUCT_CAP,
+          timeoutMs: PLAN_TIMEOUT
+        });
+        try { fs.writeFileSync(profilePath, JSON.stringify(structurePlan,null,2)); } catch(e){ console.error('profile write fail', e.message); }
+      }
+      if(structurePlan){
+        console.log(`[PLAN_APPLY] cats=${structurePlan.categories.length} products=${structurePlan.productList.length} hash=${structurePlan.hash}`);
+        // Override preference regexes if plan generated patterns
+        if(structurePlan.categoryRegex){
+          try { categoryPreferRx = new RegExp(structurePlan.categoryRegex.replace(/^\//,'').replace(/\/$/,'') ,'i'); } catch(e){ console.error('plan categoryRegex compile failed', e.message); }
+        }
+        if(structurePlan.productRegex){
+          try { preferRx = new RegExp(structurePlan.productRegex.replace(/^\//,'').replace(/\/$/,'') ,'i'); } catch(e){ console.error('plan productRegex compile failed', e.message); }
+        }
+      }
+    } catch(e){
+      console.error('[PLAN_APPLY_ERR]', e.message);
+    }
+  }
+
   const queue=[];               // BFS queue: {url, depth, type}
   // Helper to enqueue with 3-tier preference: category > product > normal
   function enqueuePreferred(item){
@@ -276,14 +304,30 @@ async function crawl(){
   const depths=new Map();       // url -> depth (for graph)
   const edges=[];               // {from,to}
 
-  START_URLS.forEach(u=>{
-    const n=normalizeURL(u, rootHost);
-    if(n && !seen.has(n)){
-      seen.add(n);
-      depths.set(n,0);
-  enqueuePreferred({url:n, depth:0});
+  if(structurePlan){
+    const rootNorm = normalizeURL(rootURL, rootHost);
+    const added = new Set();
+    function addSeed(u, depth, forcedType){
+      const n = normalizeURL(u, rootHost); if(!n) return;
+      if(!seen.has(n)){
+        seen.add(n); depths.set(n,depth);
+        enqueuePreferred({ url:n, depth, type:forcedType });
+        added.add(n);
+      }
     }
-  });
+    if(rootNorm) addSeed(rootNorm,0,'category');
+    (structurePlan.categories||[]).forEach(c=>{ if(c!==rootNorm) addSeed(c,0,'category'); });
+    (structurePlan.productList||[]).forEach(p=> addSeed(p,1,'product'));
+  } else {
+    START_URLS.forEach(u=>{
+      const n=normalizeURL(u, rootHost);
+      if(n && !seen.has(n)){
+        seen.add(n);
+        depths.set(n,0);
+      	enqueuePreferred({url:n, depth:0});
+      }
+    });
+  }
 
   let pagesCrawled=0;
   let browser=await createBrowser(nextProxy(0));
@@ -326,6 +370,16 @@ async function crawl(){
             depths.set(norm,d);
             // Enqueue only if we still can fetch more pages and depth within limit
             if (d <= MAX_DEPTH && visitedOrder.length < MAX_PAGES){
+              // Track origin category for quick deterministic mode if needed
+              let typeHint=null;
+              if(QUICK_DET_MODE && !structurePlan){
+                const isCat = categoryPreferRx && categoryPreferRx.test(item.url);
+                const isProd = preferRx && preferRx.test(norm) && !(categoryPreferRx && categoryPreferRx.test(norm));
+                if(isProd && isCat){
+                  enqueuePreferred({ url:norm, depth:d, originCategory:item.url });
+                  continue;
+                }
+              }
               enqueuePreferred({ url:norm, depth:d });
             }
           }
@@ -341,21 +395,33 @@ async function crawl(){
     }
   }
 
-  // Per-category product quota tracking (quick deterministic mode)
+  // Product quota tracking (supports quick mode and full-auto plan)
   const perCategoryCounts = new Map();
   let globalProductCount = 0;
+  const productCategoryMap = new Map();
+  if(structurePlan){
+    for(const cat of Object.keys(structurePlan.categoryProducts||{})){
+      for(const p of structurePlan.categoryProducts[cat]||[]){ productCategoryMap.set(p, cat); }
+    }
+  }
 
   function exceedsProductQuotas(url){
-    if (!QUICK_DET_MODE) return false;
     const isProduct = preferRx && preferRx.test(url) && !(categoryPreferRx && categoryPreferRx.test(url));
     if(!isProduct) return false;
-    if (TOTAL_PRODUCT_CAP && globalProductCount >= TOTAL_PRODUCT_CAP) return true;
-    // Map products to nearest preceding category depth parent? Simplify: parse path for category-like token.
-    // Placeholder: category key is domain (single bucket) if no explicit category detection.
-    let catKey='__global__';
-    // Future enhancement: maintain referring category when enqueuing.
-    const current= perCategoryCounts.get(catKey)||0;
-    if (CATEGORY_PRODUCT_QUOTA && current >= CATEGORY_PRODUCT_QUOTA) return true;
+    if(structurePlan){
+      if(structurePlan.globalProductCap && globalProductCount >= structurePlan.globalProductCap) return true;
+      const cat = productCategoryMap.get(url) || '__uncat__';
+      const limit = structurePlan.productsPerCategory || PLAN_PRODUCTS_PER_CATEGORY;
+      const current = perCategoryCounts.get(cat)||0;
+      if(limit && current >= limit) return true;
+      return false;
+    }
+    if(QUICK_DET_MODE){
+      if (TOTAL_PRODUCT_CAP && globalProductCount >= TOTAL_PRODUCT_CAP) return true;
+      const catKey='__global__';
+      const current= perCategoryCounts.get(catKey)||0;
+      if (CATEGORY_PRODUCT_QUOTA && current >= CATEGORY_PRODUCT_QUOTA) return true;
+    }
     return false;
   }
 
@@ -374,12 +440,17 @@ async function crawl(){
     const item=queue.shift();
     if (exceedsProductQuotas(item.url)) continue;
     await processItem(item);
-    if (QUICK_DET_MODE){
-      const isProduct = preferRx && preferRx.test(item.url) && !(categoryPreferRx && categoryPreferRx.test(item.url));
-      if (isProduct){
-        globalProductCount++;
-        const k='__global__';
-        perCategoryCounts.set(k,(perCategoryCounts.get(k)||0)+1);
+    const isProduct = preferRx && preferRx.test(item.url) && !(categoryPreferRx && categoryPreferRx.test(item.url));
+    if(isProduct){
+      globalProductCount++;
+      if(structurePlan){
+        const cat = productCategoryMap.get(item.url) || '__uncat__';
+        perCategoryCounts.set(cat,(perCategoryCounts.get(cat)||0)+1);
+      } else if (QUICK_DET_MODE){
+        // Use originCategory tagged when enqueued if present to distribute quota
+        const originCat = item.originCategory || '__global__';
+        if(!productCategoryMap.has(item.url) && originCat !== '__global__') productCategoryMap.set(item.url, originCat);
+        perCategoryCounts.set(originCat,(perCategoryCounts.get(originCat)||0)+1);
       }
     }
   }
