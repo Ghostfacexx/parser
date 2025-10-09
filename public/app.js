@@ -31,7 +31,9 @@
   try{
     const es=new EventSource('/api/logs');
     es.onmessage=e=>{
-      logLive(e.data);
+      const line=e.data;
+      logLive(line);
+      try{ handleLiveLine(line); }catch(err){ /* ignore */ }
       if(/JOB_START|JOB_EXIT|CRAWL_EXIT|AUTO_EXPAND_EXIT/.test(e.data)) setTimeout(loadRuns,600);
     };
   }catch(e){ logLive('SSE error '+e.message); }
@@ -355,6 +357,63 @@
 
   // ---------- Init
   loadRuns(); loadPlatforms(); refreshJobs(); logCap('Init complete (advanced)');
+  // Live stats state
+  const liveStatsEl = id('liveStats');
+  const liveStatsDetail = id('liveStatsDetail');
+  const stat = {
+    planHash:'', planCats:0, planProducts:0, planReused:false,
+    pagesCrawled:0, pagesDiscovered:0,
+    productsCrawled:0, categoriesCrawled:0,
+    startedAt: Date.now(), lastEvent: ''
+  };
+  function renderStats(){
+    if(!liveStatsEl) return;
+    const items=[
+      ['Plan Hash', stat.planHash||'-'],
+      ['Plan Cats', stat.planCats],
+      ['Plan Prods', stat.planProducts],
+      ['Reused', stat.planReused?'yes':'no'],
+      ['Crawled Pages', stat.pagesCrawled],
+      ['Discovered', stat.pagesDiscovered],
+      ['Prod Crawled', stat.productsCrawled],
+      ['Cat Crawled', stat.categoriesCrawled],
+      ['Last', stat.lastEvent?new Date(stat.lastEvent).toLocaleTimeString():'-']
+    ];
+      liveStatsEl.innerHTML = items.map(([k,v])=>`<div style="flex:0 0 auto;background:linear-gradient(135deg,#0a57ff,#0846cc);color:#fff;padding:.45rem .6rem;border-radius:10px;min-width:92px;box-shadow:0 2px 4px rgba(0,0,0,.15);display:flex;flex-direction:column;justify-content:center;align-items:center"><div style="font-size:.55rem;letter-spacing:.5px;text-transform:uppercase;opacity:.85">${k}</div><div style="font-weight:600;font-size:.78rem;margin-top:.15rem">${v}</div></div>`).join('');
+  }
+  function handleLiveLine(line){
+    // PLAN lines
+    let m;
+    if((m=line.match(/^\[PLAN_REUSE\].*hash=([^\s]+).*cats=(\d+) products=(\d+)/))){
+      stat.planHash=m[1]; stat.planCats=+m[2]; stat.planProducts=+m[3]; stat.planReused=true; stat.lastEvent=Date.now(); renderStats(); return; }
+    if((m=line.match(/^\[PLAN_APPLY\] cats=(\d+) products=(\d+) hash=([^\s]+)/))){
+      stat.planCats=+m[1]; stat.planProducts=+m[2]; stat.planHash=m[3]; stat.planReused=false; stat.lastEvent=Date.now(); renderStats(); return; }
+    if((m=line.match(/^\[PLAN_DONE\] categories=(\d+) products=(\d+) hash=([^\s]+)/))){
+      stat.planCats=+m[1]; stat.planProducts=+m[2]; stat.planHash=m[3]; stat.lastEvent=Date.now(); renderStats(); return; }
+    if((m=line.match(/^\[PLAN_START\]/))){ stat.lastEvent=Date.now(); renderStats(); return; }
+    // Crawl progress lines - expecting format like: [CRAWL] d=0 ok url=... (we'll increment)
+    if(line.startsWith('[CRAWL]')){ stat.pagesCrawled++; stat.lastEvent=Date.now(); renderStats(); }
+    if(line.startsWith('[CRAWL_DONE]')){ // extract discovered and crawled counts if present
+      const dm=line.match(/discovered=(\d+) crawled=(\d+)/i);
+      if(dm){ stat.pagesDiscovered=+dm[1]; stat.pagesCrawled=+dm[2]; }
+      stat.lastEvent=Date.now(); renderStats();
+    }
+    // Attempt to infer product vs category from URL classification (heuristic regexes)
+    if(line.startsWith('[CRAWL]')){
+      const urlMatch=line.match(/url=([^\s]+)/);
+      if(urlMatch){
+        const u=urlMatch[1];
+        if(/(product|sku|item|prod)/i.test(u)) stat.productsCrawled++;
+        if(/(category|collections|cat)/i.test(u)) stat.categoriesCrawled++;
+      }
+    }
+    // Keep limited detailed tail
+    if(liveStatsDetail){
+      liveStatsDetail.textContent += line+'\n';
+      if(liveStatsDetail.textContent.length>24000) liveStatsDetail.textContent = liveStatsDetail.textContent.slice(-20000);
+    }
+  }
+  renderStats();
 
   // ---------- Plan Preview
   const planBtn = id('btnLoadPlan');
