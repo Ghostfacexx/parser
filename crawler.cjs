@@ -104,6 +104,32 @@ const PROXIES_FILE  = process.env.PROXIES_FILE || '';
 const STABLE_SESSION= flag('STABLE_SESSION', true);
 const ROTATE_SESSION= flag('ROTATE_SESSION', false);
 const ROTATE_EVERY  = parseInt(process.env.ROTATE_EVERY||'0',10);
+// Deterministic / quick-win & full-auto flags
+const QUICK_DET_MODE = flag('QUICK_DET_MODE', false); // stable ordering & quotas
+const FULL_AUTO_MODE = flag('FULL_AUTO_MODE', false); // invoke structure detection probe
+const CATEGORY_PRODUCT_QUOTA = parseInt(process.env.CATEGORY_PRODUCT_QUOTA||'0',10); // per-category cap (quick mode)
+const TOTAL_PRODUCT_CAP = parseInt(process.env.TOTAL_PRODUCT_CAP||'0',10); // across all categories/products
+const PLAN_PRODUCTS_PER_CATEGORY = parseInt(process.env.PLAN_PRODUCTS_PER_CATEGORY||'10',10);
+const PLAN_GLOBAL_PRODUCT_CAP = parseInt(process.env.PLAN_GLOBAL_PRODUCT_CAP||'400',10);
+const PLAN_PROBE_CATEGORY_LIMIT = parseInt(process.env.PLAN_PROBE_CATEGORY_LIMIT||'40',10);
+const PLAN_TIMEOUT = parseInt(process.env.PLAN_TIMEOUT||'15000',10);
+
+let structurePlan = null;
+if (FULL_AUTO_MODE){
+  try {
+    const { detectStructure } = require('./lib/structure-detect.cjs');
+    structurePlan = detectStructure({
+      startUrls: START_URLS,
+      outputDir: OUTPUT_DIR,
+      probeCategoryLimit: PLAN_PROBE_CATEGORY_LIMIT,
+      productsPerCategory: PLAN_PRODUCTS_PER_CATEGORY,
+      globalProductCap: PLAN_GLOBAL_PRODUCT_CAP,
+      timeoutMs: PLAN_TIMEOUT
+    });
+  } catch(e){
+    console.error('[FULL_AUTO_MODE_ERR]', e.message);
+  }
+}
 
 /* Regex compile */
 let allowRx=null, denyRx=null;
@@ -212,13 +238,20 @@ async function crawl(){
   const rootURL=START_URLS[0];
   const rootHost=(()=>{ try { return new URL(rootURL).hostname; } catch { return ''; }})();
 
-  const queue=[];               // BFS queue: {url, depth}
+  const queue=[];               // BFS queue: {url, depth, type}
   // Helper to enqueue with 3-tier preference: category > product > normal
   function enqueuePreferred(item){
     if (!item || !item.url) return;
     const u=item.url;
     const isCategory = categoryPreferRx ? categoryPreferRx.test(u) : false;
     const isProduct = !isCategory && (preferRx ? preferRx.test(u) : false);
+    if (QUICK_DET_MODE){
+      // Stable deterministic ordering: maintain buckets, then merge.
+      // Simpler implementation: just tag and push; sorting happens before dequeue.
+      item.type = isCategory? 'category' : (isProduct? 'product':'normal');
+      queue.push(item);
+      return;
+    }
     if (isCategory){
       // Put at absolute front
       queue.unshift(item);
@@ -308,10 +341,47 @@ async function crawl(){
     }
   }
 
+  // Per-category product quota tracking (quick deterministic mode)
+  const perCategoryCounts = new Map();
+  let globalProductCount = 0;
+
+  function exceedsProductQuotas(url){
+    if (!QUICK_DET_MODE) return false;
+    const isProduct = preferRx && preferRx.test(url) && !(categoryPreferRx && categoryPreferRx.test(url));
+    if(!isProduct) return false;
+    if (TOTAL_PRODUCT_CAP && globalProductCount >= TOTAL_PRODUCT_CAP) return true;
+    // Map products to nearest preceding category depth parent? Simplify: parse path for category-like token.
+    // Placeholder: category key is domain (single bucket) if no explicit category detection.
+    let catKey='__global__';
+    // Future enhancement: maintain referring category when enqueuing.
+    const current= perCategoryCounts.get(catKey)||0;
+    if (CATEGORY_PRODUCT_QUOTA && current >= CATEGORY_PRODUCT_QUOTA) return true;
+    return false;
+  }
+
   while(queue.length && pagesCrawled < MAX_PAGES){
     if (stopRequested(OUTPUT_DIR)) break;
+    if (QUICK_DET_MODE){
+      // Re-rank queue deterministically: categories, then products, then normal; each sub-sorted lexicographically
+      queue.sort((a,b)=>{
+        const rank = {category:0, product:1, normal:2};
+        const ra = rank[a.type||'normal'];
+        const rb = rank[b.type||'normal'];
+        if (ra!==rb) return ra-rb;
+        return a.url.localeCompare(b.url);
+      });
+    }
     const item=queue.shift();
+    if (exceedsProductQuotas(item.url)) continue;
     await processItem(item);
+    if (QUICK_DET_MODE){
+      const isProduct = preferRx && preferRx.test(item.url) && !(categoryPreferRx && categoryPreferRx.test(item.url));
+      if (isProduct){
+        globalProductCount++;
+        const k='__global__';
+        perCategoryCounts.set(k,(perCategoryCounts.get(k)||0)+1);
+      }
+    }
   }
 
   try { await browser.close(); } catch {}
